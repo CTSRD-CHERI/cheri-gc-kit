@@ -32,6 +32,8 @@
 
 #include <atomic>
 
+namespace {
+
 /**
  * Optionally-atomic counter.  This compiles away to nothing when not in debug
  * mode.
@@ -126,3 +128,5 @@ struct Counter
 	typename std::conditional<IsAtomic, std::atomic<uint64_t>, uint64_t>::type val = 0;
 #endif
 };
+
+} // Anonymous namespace

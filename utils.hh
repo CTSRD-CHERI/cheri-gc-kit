@@ -33,6 +33,9 @@
 #include <cstring>
 #include <limits.h>
 #include "cheri.hh"
+
+namespace {
+
 /**
  * Compile-time evaluation of the base-2 logarithm of a number.
  */
@@ -201,3 +204,4 @@ class SplicedForwardIterator<It1, It2> make_spliced_forward_iterator(It1 &&start
  */
 extern "C" void clear_regs();
 
+} // Anonymous namespace

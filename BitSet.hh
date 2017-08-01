@@ -33,6 +33,8 @@
 #include <cstdint>
 #include <array>
 
+namespace {
+
 /**
  * Class representing a fixed-size array of bits.  The atomic flag, if set,
  * ensures that set and clear operations are atomic, but assumes that any of
@@ -196,3 +198,5 @@ class BitSet
 		return S;
 	}
 };
+
+} // Anonymous namespace

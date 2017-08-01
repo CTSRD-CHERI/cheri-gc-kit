@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <type_traits>
 
+namespace {
 
 template<size_t HeapSize, class Header=void>
 class bump_the_pointer_or_large_heap 
@@ -239,3 +240,5 @@ class bump_the_pointer_or_large_heap
 		small_heap.collect();
 	}
 };
+
+} // Anonymous namespace.

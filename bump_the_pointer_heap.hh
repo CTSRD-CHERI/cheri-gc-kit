@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <type_traits>
 
+namespace {
 
 /**
  * A simple fixed-size bump-the-pointer heap.  Allows an optional object header.
@@ -389,3 +390,5 @@ class bump_the_pointer_heap
 		delete (callback_buffer) (gc);
 	}
 };
+
+} // Anonymous namespace

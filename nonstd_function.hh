@@ -30,6 +30,8 @@
 
 #pragma once
 
+namespace {
+
 /**
  * `std::function` doesn't support custom allocators, so provide a simple
  * wrapper that allows zero-argument functions to be invoked generically.
@@ -64,3 +66,5 @@ struct ConcreteFunction : Function
 	 */
 	T fn;
 };
+
+} // Anonymous namespace
