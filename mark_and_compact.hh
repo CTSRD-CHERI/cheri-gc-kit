@@ -35,6 +35,7 @@
 #include "cheri.hh"
 #include "page.hh"
 #include "counter.hh"
+#include "mark.hh"
 
 namespace 
 {
@@ -79,6 +80,78 @@ struct alignas(void*) mark_and_compact_object_header
 						 	"unknown")),
 				contains_pointers ? "true" : "false");
 	}
+	/**
+	 * Set the colour to marked.
+	 *
+	 * This method avoids the need for the marker to know the implementation
+	 * details of the header.
+	 */
+	void set_marked()
+	{
+		color = marked;
+	}
+	/**
+	 * Set the colour to visited.
+	 *
+	 * This method avoids the need for the marker to know the implementation
+	 * details of the header.
+	 */
+	void set_visited()
+	{
+		color = visited;
+	}
+	/**
+	 * Set the contains-pointers flag.
+	 *
+	 * This method avoids the need for the marker to know the implementation
+	 * details of the header.
+	 */
+	void set_contains_pointers()
+	{
+		contains_pointers = true;
+	}
+	/**
+	 * Reset the state.
+	 *
+	 * This method avoids the need for the marker to know the implementation
+	 * details of the header.
+	 */
+	void reset()
+	{
+		color = unmarked;
+		displacement = 0;
+		contains_pointers = false;
+	}
+	/**
+	 * Return whether the colour is visited.
+	 *
+	 * This method avoids the need for the marker to know the implementation
+	 * details of the header.
+	 */
+	bool is_visited()
+	{
+		return color == visited;
+	}
+	/**
+	 * Return whether the colour is marked.
+	 *
+	 * This method avoids the need for the marker to know the implementation
+	 * details of the header.
+	 */
+	bool is_marked()
+	{
+		return color == marked;
+	}
+	/**
+	 * Return whether the colour is unmarked.
+	 *
+	 * This method avoids the need for the marker to know the implementation
+	 * details of the header.
+	 */
+	bool is_unmarked()
+	{
+		return color == unmarked;
+	}
 };
 
 // The header is expected to be small enough to fit in a pointer.
@@ -92,32 +165,28 @@ static_assert(sizeof(mark_and_compact_object_header) <= sizeof(void*),
  * as template parameters.
  */
 template<class RootSet, class Heap>
-class mark_and_compact
+class mark_and_compact : mark<RootSet, Heap, mark_and_compact_object_header>
 {
 	/**
-	 * The root set object.
+	 * Import the superclass name.
 	 */
-	RootSet m;
+	using Super = mark<RootSet, Heap, mark_and_compact_object_header>;
 	/**
-	 * Reference to the heap.  The heap is expected to last as long as the
-	 * program.
+	 * Import the mark set from the superclass.
 	 */
-	Heap &h;
+	using Super::m;
 	/**
-	 * The number of objects that 
+	 * Import the heap from the superclass.
 	 */
-	Counter<> visited;
+	using Super::h;
 	/**
-	 * Capability comparator that uses the base of the capabilities for comparison.
+	 * Import the visited counter from the superclass.
 	 */
-	template<typename T>
-	struct cap_less
-	{
-		constexpr bool operator()(const T *&lhs, const T *&rhs) const 
-		{
-			return cheri::base(lhs) < cheri::base(rhs);
-		}
-	};
+	using Super::visited;
+	/**
+	 * Import the mark list from the superclass.
+	 */
+	using Super::mark_list;
 	/**
 	 * Import the `cheri::capability` class.
 	 */
@@ -128,105 +197,6 @@ class mark_and_compact
 	using object_header = mark_and_compact_object_header;
 	static_assert(std::is_same<typename Heap::object_header, object_header>::value,
 			"Heap must insert correct object header");
-	/**
-	 * The mark list (i.e. list of objects seen but not yet inspected by the
-	 * collector).  This is page allocated and should be invisible to the
-	 * collector.
-	 */
-	std::vector<void*, PageAllocator<void*>> mark_list;
-	/**
-	 * Mark the object referred to by the specified pointer.
-	 */
-	void mark(void *p)
-	{
-		object_header *header;
-		void *obj = h.object_for_allocation(p, header);
-		// If this object isn't one that the GC allocated, ignore it.
-		// All non-GC memory is either a root (in which case we've seen it
-		// already), or assumed not to point to GC'd objects.
-		if (!obj)
-		{
-			return;
-		}
-		// Objects should only be added to the mark stack if they're really
-		// objects and have not yet been seen, but if one is then skip it.
-		//
-		// FIXME: We should be able to assert that color is marked, find out
-		// why we can't.
-		if (header->color == object_header::visited)
-		{
-			return;
-		}
-		// Count the number of visited objects, for sanity checking later.
-		++visited;
-		// Initialise the header.
-		header->color = object_header::visited;
-		header->displacement = 0;
-		header->contains_pointers = false;
-		// Scan the contents of the object.
-		capability<void*> cap(static_cast<void**>(obj));
-		for (void *ptr : cap)
-		{
-			// Skip pointer-sized things that are not pointers.
-			capability<void> ptr_as_cap(ptr);
-			if (!ptr_as_cap)
-			{
-				continue;
-			}
-			// If we see a pointer, record the fact.
-			object_header *pointee_header;
-			header->contains_pointers = true;
-			ptr = h.object_for_allocation(ptr, pointee_header);
-			if (!ptr)
-			{
-				continue;
-			}
-			// If an object has not yet been seen, add it to the mark list.
-			if (pointee_header->color == object_header::unmarked)
-			{
-				pointee_header->color = object_header::marked;
-				// Note: BDW observe that having separate mark lists for nearby
-				// allocations improves cache / TLB usage.
-				mark_list.push_back(ptr);
-			}
-		}
-	}
-	/**
-	 * Trace: Inspect all of the objects that are known live and recursively
-	 * find all that are reachable from them.
-	 */
-	void trace()
-	{
-		while (!mark_list.empty())
-		{
-			void *p = mark_list.back();
-			mark_list.pop_back();
-			mark(p);
-		}
-	}
-	/**
-	 * Look at all of the roots and add any reachable objects to the stack.
-	 */
-	void mark_roots()
-	{
-		m.collect_roots_from_ranges();
-		// FIXME: We should record the roots of objects that we're going to
-		// move here, rather than scanning for them again.
-		for (auto &r : m)
-		{
-			object_header *header;
-			if (nullptr == h.object_for_allocation(r.second, header))
-			{
-				continue;
-			}
-			if (header->color == object_header::unmarked)
-			{
-				// FIXME: We should be recording this as a reachable root
-				// so that we don't have to scan all of root memory twice.
-				mark(r.second);
-			}
-		};
-	}
 	/**
 	 * Calculate the displacements for all of the objects that we're going to move.
 	 */
@@ -346,9 +316,8 @@ class mark_and_compact
 	/**
 	 * Constructor.  
 	 */
-	mark_and_compact(Heap &heap) : h(heap)
+	mark_and_compact(Heap &heap) : Super(heap)
 	{
-		m.register_global_roots();
 	}
 	/**
 	 * Run the collector.
@@ -368,8 +337,8 @@ class mark_and_compact
 		m.stop_the_world();
 		// FIXME: Other threads, sandboxes
 		m.add_thread(static_cast<void**>(__builtin_cheri_stack_get()));
-		mark_roots();
-		trace();
+		Super::mark_roots();
+		Super::trace();
 		ASSERT(mark_list.empty());
 		calculate_displacements();
 		update_pointers();
