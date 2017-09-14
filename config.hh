@@ -28,6 +28,7 @@
  * SUCH DAMAGE.
  */
 
+#pragma once
 
 namespace 
 {
