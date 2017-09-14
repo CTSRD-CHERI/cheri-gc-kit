@@ -4,7 +4,7 @@ INSTALL_DIR?=.
 all: gctest.dump
 
 gctest.dump: ${INSTALL_DIR}/gctest
-	${SDK}/bin/llvm-objdump -source -disassemble /exports/users/dc552/cheriroot/tmp/gctest > gctest.dump
+	${SDK}/bin/llvm-objdump -source -disassemble ${INSTALL_DIR}/gctest > gctest.dump
 
 ${INSTALL_DIR}/gctest: test.o clean_regs.s
 	${SDK}/bin/clang test.o -lpthread -o ${INSTALL_DIR}/gctest -static -mabi=purecap clean_regs.s
