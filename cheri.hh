@@ -74,6 +74,15 @@ vaddr_t base(T *ptr)
 }
 
 /**
+ * Sets the offset in a capability.
+ */
+template<typename T>
+__CHERI_INLINE
+T* set_offset(T *ptr, vaddr_t offset)
+{
+	return static_cast<T*>(__builtin_cheri_offset_set(static_cast<void*>(ptr), offset));
+}
+/**
  * The `cheri::capability` class encapsulates a CHERI capability, providing
  * methods for accessing the properties of the capability.
  */
@@ -369,7 +378,7 @@ class capability
 	__CHERI_INLINE
 	T* __capability end()
 	{
-		return ptr + size();
+		return cheri::set_offset(ptr, length());
 	}
 	/**
 	 * Returns the underlying pointer.
