@@ -31,8 +31,51 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <limits.h>
 #include "cheri.hh"
+
+namespace {
+// Pure virtual functions are implemented as a call to this.  Ensure that we
+// provide a copy when linking, but as a private symbol so that nothing
+// external will see our version.
+extern "C" void __cxa_pure_virtual() { abort(); }
+}
+// unwind.h doesn't expose `_Unwind_Backtrace` unless `_GNU_SOURCE` is defined.
+#define _GNU_SOURCE
+#include <unwind.h>
+#undef _GNU_SOURCE
+/**
+ * Assertion failure function.  This improves C's assert by providing
+ * backtraces on failure.
+ */
+[[noreturn]]
+void assert_fail(const char *func, const char *file, int line, const char *err)
+{
+	fprintf(stderr, "Assertion failed: %s, function %s, file %s:%d\n", err, func, file, line);
+	int depth = 0;
+	fprintf(stderr, "-- BACKTRACE --\n");
+	_Unwind_Backtrace([](struct _Unwind_Context *context, void *arg)
+		{
+			int &depth = *(int*)arg;
+			fprintf(stderr, "[%2d] %#p\n", depth++, reinterpret_cast<void*>(_Unwind_GetIP(context)));
+			return _URC_NO_REASON;
+		}, (void*)&depth);
+	fprintf(stderr, "-- END BACKTRACE --\n");
+	abort();
+}
+#ifndef NDEBUG
+#define ASSERT(x) \
+	do { \
+		if (!(x))\
+		{\
+			assert_fail(__func__, __FILE__, __LINE__, #x);\
+		}\
+	} while(0)
+#else
+#define ASSERT(x) do { } while(0)
+#endif
 
 namespace {
 
