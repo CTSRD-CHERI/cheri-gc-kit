@@ -40,12 +40,18 @@
 namespace
 {
 
+// Forward declare mark_and_compact so that it can be a friend of the header.
+template<class RootSet, class Heap>
+class mark_and_compact;
+
 /**
  * Object header for this collector.  Declared outside the class so that its
  * type doesn't depend on the template arguments.
  */
-struct alignas(void*) mark_and_compact_object_header 
+class alignas(void*) mark_and_compact_object_header
 {
+	template<class RootSet, class Heap>
+	friend class mark_and_compact;
 	/**
 	 * The displacement for the object.  After the object has been relocated,
 	 * the new version will be `displacement` bytes before the old.
@@ -67,6 +73,7 @@ struct alignas(void*) mark_and_compact_object_header
 	 * Does the object contain any pointers?
 	 */
 	bool contains_pointers;
+	public:
 	/**
 	 * Helper for debugging: dump the header in a human-readable format.
 	 */
