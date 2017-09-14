@@ -37,7 +37,7 @@
 #include "counter.hh"
 #include "mark.hh"
 
-namespace 
+namespace
 {
 
 /**
@@ -314,7 +314,7 @@ class mark_and_compact : mark<RootSet, Heap, mark_and_compact_object_header>
 	}
 	public:
 	/**
-	 * Constructor.  
+	 * Constructor.
 	 */
 	mark_and_compact(Heap &heap) : Super(heap)
 	{
