@@ -106,6 +106,7 @@ class mark
 		++visited;
 		// Initialise the header.
 		header->reset();
+		header->set_visited();
 		// Scan the contents of the object.
 		capability<void*> cap(static_cast<void**>(obj));
 		for (void *ptr : cap)
