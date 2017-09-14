@@ -118,7 +118,7 @@ class mark
 			}
 			// If we see a pointer, record the fact.
 			Header *pointee_header;
-			header->contains_pointers = true;
+			header->set_contains_pointers();
 			ptr = h.object_for_allocation(ptr, pointee_header);
 			if (!ptr)
 			{
@@ -162,7 +162,7 @@ class mark
 			{
 				continue;
 			}
-			if (header->color == Header::unmarked)
+			if (header->is_unmarked())
 			{
 				// FIXME: We should be recording this as a reachable root
 				// so that we don't have to scan all of root memory twice.
