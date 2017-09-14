@@ -89,6 +89,14 @@ class BitSet
 		}
 		return false;
 	}
+	nonatomic_bitfield_word load(nonatomic_bitfield_word &w)
+	{
+		return w;
+	}
+	nonatomic_bitfield_word load(std::atomic<uint64_t> &w)
+	{
+		return w.load();
+	}
 	public:
 	/**
 	 * Constructor.  Intialises bits to zero.
@@ -120,7 +128,7 @@ class BitSet
 		size_t bit = i % bits_per_word;
 		bitfield_word &w = bits[word];
 		bitfield_word desired;
-		nonatomic_bitfield_word expected = w.load();
+		nonatomic_bitfield_word expected = load(w);
 		do {
 			desired = expected | (1ULL << ((bits_per_word-1) - bit));
 		} while (!cmpexch(w, expected, desired));
