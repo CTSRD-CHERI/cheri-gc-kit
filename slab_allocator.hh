@@ -59,15 +59,21 @@ constexpr T max(T a, T b)
 }
 
 
+template<typename Header>
 struct Allocator;
 /**
- * 
+ * Class encapsulating a large table indexing from address to allocator.  We
+ * rely on the VM subsystem to lazily allocate the pages in the array and
+ * assign large regions (e.g. 8MiB) to allocators, allowing the map from region
+ * to allocator to be small.
+ *
+ * This design is inspired by SuperMalloc.
  */
-template<size_t ChunkBits, size_t ASBits, size_t PageSize>
-class PageMetadata : public PageAllocated<PageMetadata<ChunkBits, ASBits, PageSize>>
+template<size_t ChunkBits, size_t ASBits, size_t PageSize, typename Header>
+class PageMetadata : public PageAllocated<PageMetadata<ChunkBits, ASBits, PageSize, Header>>
 {
-	std::array<Allocator*, 1ULL<<(ASBits - ChunkBits)> array;
-	using self_type = PageMetadata<ChunkBits, ASBits, PageSize>;
+	std::array<Allocator<Header>*, 1ULL<<(ASBits - ChunkBits)> array;
+	using self_type = PageMetadata<ChunkBits, ASBits, PageSize, Header>;
 	size_t index_for_vaddr(vaddr_t a)
 	{
 		// Trim off any high bits that might accidentally be set.
@@ -83,41 +89,20 @@ class PageMetadata : public PageAllocated<PageMetadata<ChunkBits, ASBits, PageSi
 			"Page metadata class must not have a vtable!\n");
 		return (PageAllocated<self_type>::alloc(sizeof(self_type)));
 	}
-	Allocator *allocator_for_address(vaddr_t addr)
+	Allocator<Header> *allocator_for_address(vaddr_t addr)
 	{
 		return array[index_for_vaddr(addr)];
 	}
-	void set_allocator_for_address(Allocator *allocator, vaddr_t addr)
+	void set_allocator_for_address(Allocator<Header> *allocator, vaddr_t addr)
 	{
 		array[index_for_vaddr(addr)] = allocator;
 	}
 };
 
-/**
- * The type used to describe the global metadata.
- */
-using PageMetadataArray = PageMetadata<chunk_size_bits, address_space_size_bits, page_size>;
-
-/**
- * The array of metadata about the size of a type.
- */
-PageMetadataArray *p;
-
-/**
- * Map from an address to an allocator.
- */
-static Allocator *allocator_for_address(void *addr)
-{
-	return p->allocator_for_address((vaddr_t)addr);
-}
-static void set_allocator_for_address(Allocator *a, void *addr)
-{
-	return p->set_allocator_for_address(a, (vaddr_t)addr);
-}
-
+template<typename Header>
 struct Allocator
 {
-	std::atomic<Allocator*> next;
+	std::atomic<Allocator<Header>*> next;
 	/**
 	 * Allocate an object of the specified size.  For small allocations, this is 
 	 */
@@ -132,15 +117,22 @@ struct Allocator
 	 * it should be re-added to the list.
 	 */
 	virtual bool free(void *) { return false; }
+	/**
+	 * Return whether the allocator is full (i.e. unable to allocate anything
+	 * else).
+	 */
 	virtual bool full() { return true; }
 	virtual int bucket() const { return -1; }
+	virtual void *allocation_for_address(vaddr_t, Header *&) { return nullptr; }
 };
 
 static constexpr size_t gcd(size_t a, size_t b)
 {
 	return b == 0 ? a : gcd(b, a % b);
 }
-template<size_t AllocSize, size_t ChunkSize>
+
+
+template<size_t AllocSize, size_t ChunkSize, typename Header>
 class SmallAllocationHeader
 {
 	public:
@@ -163,9 +155,35 @@ class SmallAllocationHeader
 		BitSet<allocs_per_folio> free;
 	};
 	/**
-	 * Linked list entries.  Each entry
+	 * Linked list entries.
 	 */
 	std::array<list_entry, folios_per_chunk> list_entries;
+	template<typename HeaderTy, class Enable = void>
+	struct HeaderList
+	{
+	};
+	template<typename HeaderTy>
+	struct HeaderList<HeaderTy, typename std::enable_if<std::is_void<HeaderTy>::value>::type>
+	{
+		Header *header_at_index(size_t idx)
+		{
+			return nullptr;
+		}
+	};
+	template<typename HeaderTy>
+	struct HeaderList<HeaderTy, typename std::enable_if<!std::is_void<HeaderTy>::value>::type>
+	{
+		std::array<Header, folios_per_chunk*allocs_per_folio> array;
+		Header *header_at_index(size_t idx)
+		{
+			return array.at(idx);
+		}
+	};
+	HeaderList<Header> headers;
+	Header *header_at_index(size_t idx)
+	{
+		return headers.header_at_index(idx);
+	}
 	public:
 	/**
 	 * A conservative approximation of the bucket that has the most free space.
@@ -325,25 +343,25 @@ class SmallAllocationHeader
 	}
 };
 
-template<size_t AllocSize>
-class SmallAllocator : public Allocator,
-                       public SmallAllocationHeader<AllocSize, chunk_size>,
-                       public PageAllocated<SmallAllocator<AllocSize>>
+template<size_t AllocSize, typename Header>
+class SmallAllocator : public Allocator<Header>,
+                       public SmallAllocationHeader<AllocSize, chunk_size, Header>,
+                       public PageAllocated<SmallAllocator<AllocSize, Header>>
 {
-	using Header = SmallAllocationHeader<AllocSize, chunk_size>;
-	using self_type = SmallAllocator<AllocSize>;
+	using ChunkHeader = SmallAllocationHeader<AllocSize, chunk_size, Header>;
+	using self_type = SmallAllocator<AllocSize, Header>;
 	int bucket() const override
 	{
 		return bucket_for_size(AllocSize);
 	}
 	bool full() override
 	{
-		return Header::free_allocs_total == 0;
+		return ChunkHeader::free_allocs_total == 0;
 	}
 	void *alloc(size_t sz) override
 	{
 		assert(sz <= AllocSize);
-		size_t offset = Header::reserve_allocation();
+		size_t offset = ChunkHeader::reserve_allocation();
 		if (offset == -1)
 		{
 			return nullptr;
@@ -358,64 +376,73 @@ class SmallAllocator : public Allocator,
 	{
 		size_t offset = reinterpret_cast<char*>(ptr) - reinterpret_cast<char*>(this);
 		assert(offset < chunk_size);
-		Header::free_allocation(offset);
+		ChunkHeader::free_allocation(offset);
 		return false;
 	};
-	SmallAllocator() : Header(sizeof(*this))
+	SmallAllocator() : ChunkHeader(sizeof(*this))
 	{
 		assert(!full());
 	}
 	public:
-	static SmallAllocator<AllocSize> *create()
+	static SmallAllocator<AllocSize, Header> *create()
 	{
-		static_assert(chunk_size > sizeof(SmallAllocator<AllocSize>),
+		static_assert(chunk_size > sizeof(SmallAllocator<AllocSize, Header>),
 		              "Metadata is bigger than chunk!");
 		char *p = PageAllocated<self_type>::alloc(chunk_size, log2<chunk_size>());
-		auto *a = new (p) SmallAllocator<AllocSize>();
+		auto *a = new (p) SmallAllocator<AllocSize, Header>();
 		set_allocator_for_address(a, reinterpret_cast<void*>(a));
 		return a;
 	}
 };
 
-template<size_t Bucket = fixed_buckets>
-Allocator* create_small_allocator(int bucket)
+template<typename Header, size_t Bucket = fixed_buckets>
+struct small_allocator_factory
 {
-	if (bucket == Bucket)
+	static Allocator<Header>* create(int bucket)
 	{
-		const size_t size = BucketSize<Bucket>::value;
-		//assert(bucket_for_size(size) == bucket);
-		return SmallAllocator<size>::create();
+		if (bucket == Bucket)
+		{
+			const size_t size = BucketSize<Bucket>::value;
+			//assert(bucket_for_size(size) == bucket);
+			return SmallAllocator<size, Header>::create();
+		}
+		return small_allocator_factory<Header, Bucket-1>::create(bucket);
 	}
-	return create_small_allocator<Bucket-1>(bucket);
-}
-template<>
-Allocator* create_small_allocator<0>(int bucket)
-{
-	if (bucket == 0)
-	{
-		return SmallAllocator<BucketSize<0>::value>::create();
-	}
-	assert(0);
-	return nullptr;
-}
+};
 
-struct Buckets : public PageAllocated<Buckets>
+template<typename Header>
+struct small_allocator_factory<Header, 0>
 {
-	std::array<std::atomic<Allocator*>, fixed_buckets> fixed_buckets;
+	static Allocator<Header>* create(int bucket)
+	{
+		if (bucket == 0)
+		{
+			return SmallAllocator<BucketSize<0>::value, Header>::create();
+		}
+		assert(0);
+		return nullptr;
+	}
+};
+
+template<typename Header>
+struct Buckets : public PageAllocated<Buckets<Header>>
+{
+	using PageMetadataArray = PageMetadata<chunk_size_bits, address_space_size_bits, page_size, Header>;
+	std::array<std::atomic<Allocator<Header>*>, fixed_buckets> fixed_buckets;
 	PageMetadataArray *p;
 	Buckets(PageMetadataArray *metadata) : p(metadata) {}
-	Allocator *allocator_for_bucket(size_t bucket)
+	Allocator<Header> *allocator_for_bucket(size_t bucket)
 	{
 		// No lock held.  The returned object is not locked, so callers may
 		// need to try multiple times to get an allocator that has empty space.
-		Allocator *a = fixed_buckets[bucket].load(std::memory_order_relaxed);
+		Allocator<Header> *a = fixed_buckets[bucket].load(std::memory_order_relaxed);
 		// FIXME: Handle creating huge allocators for things that want to just be mmap'd.
 		if (a == nullptr)
 		{
-			a = create_small_allocator(bucket);
+			a = small_allocator_factory<Header>::create(bucket);
 			assert(a->bucket() == bucket);
 			assert(!a->full());
-			Allocator *old = nullptr;
+			Allocator<Header> *old = nullptr;
 			while (!fixed_buckets[bucket].compare_exchange_weak(old, a, std::memory_order_relaxed))
 			{
 				a->next = old;
@@ -426,7 +453,7 @@ struct Buckets : public PageAllocated<Buckets>
 		{
 			// FIXME: This is racy.  An allocator can transition from full to
 			// non-full in parallel with this.  
-			Allocator *next = a->next.exchange(nullptr);
+			Allocator<Header> *next = a->next.exchange(nullptr);
 			fixed_buckets[bucket].compare_exchange_strong(a, next, std::memory_order_relaxed);
 			return allocator_for_bucket(bucket);
 		}
@@ -435,10 +462,12 @@ struct Buckets : public PageAllocated<Buckets>
 };
 
 
+template<typename Header>
 class slab_allocator
 {
+	using PageMetadataArray = PageMetadata<chunk_size_bits, address_space_size_bits, page_size, Header>;
 	PageMetadataArray *p = PageMetadataArray::create();
-	Buckets global_buckets = { p };
+	Buckets<Header> global_buckets = { p };
 	public:
 	void *alloc(size_t size)
 	{
@@ -459,10 +488,11 @@ class slab_allocator
 	}
 	void free(void *ptr)
 	{
-		Allocator *a = p->allocator_for_address((vaddr_t)ptr);
+		Allocator<Header> *a = p->allocator_for_address((vaddr_t)ptr);
 		assert(a);
 		a->free(ptr);
 	}
+
 };
 
 }
