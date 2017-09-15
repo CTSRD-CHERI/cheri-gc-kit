@@ -70,7 +70,7 @@ struct Allocator;
  * This design is inspired by SuperMalloc.
  */
 template<size_t ChunkBits, size_t ASBits, size_t PageSize, typename Header>
-class PageMetadata : public PageAllocated<PageMetadata<ChunkBits, ASBits, PageSize, Header>>
+class PageMetadata
 {
 	std::array<Allocator<Header>*, 1ULL<<(ASBits - ChunkBits)> array;
 	using self_type = PageMetadata<ChunkBits, ASBits, PageSize, Header>;
@@ -82,12 +82,13 @@ class PageMetadata : public PageAllocated<PageMetadata<ChunkBits, ASBits, PageSi
 		a >>= log2<chunk_size>();
 		return a;
 	}
+	PageMetadata() {}
 	public:
 	static self_type *create()
 	{
 		static_assert(!std::is_polymorphic<self_type>::value,
 			"Page metadata class must not have a vtable!\n");
-		return (PageAllocated<self_type>::alloc(sizeof(self_type)));
+		return (PageAllocator<self_type>().allocate(sizeof(self_type)));
 	}
 	Allocator<Header> *allocator_for_address(vaddr_t addr)
 	{
@@ -383,16 +384,6 @@ class SmallAllocator : public Allocator<Header>,
 	{
 		assert(!full());
 	}
-	public:
-	static SmallAllocator<AllocSize, Header> *create()
-	{
-		static_assert(chunk_size > sizeof(SmallAllocator<AllocSize, Header>),
-		              "Metadata is bigger than chunk!");
-		char *p = PageAllocated<self_type>::alloc(chunk_size, log2<chunk_size>());
-		auto *a = new (p) SmallAllocator<AllocSize, Header>();
-		set_allocator_for_address(a, reinterpret_cast<void*>(a));
-		return a;
-	}
 };
 
 template<typename Header, size_t Bucket = fixed_buckets>
@@ -404,7 +395,7 @@ struct small_allocator_factory
 		{
 			const size_t size = BucketSize<Bucket>::value;
 			//assert(bucket_for_size(size) == bucket);
-			return SmallAllocator<size, Header>::create();
+			return new SmallAllocator<size, Header>();
 		}
 		return small_allocator_factory<Header, Bucket-1>::create(bucket);
 	}
@@ -494,5 +485,6 @@ class slab_allocator
 	}
 
 };
+
 
 }
