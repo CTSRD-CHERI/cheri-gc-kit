@@ -36,7 +36,7 @@ namespace
  * The number of valid non-zero bits that we expect to see in a virtual
  * address.
  */
-constexpr const int address_space_size_bits = 48;
+constexpr const int address_space_size_bits = 40;
 /**
  * Size of a cache line.  This doesn't have to be accurate (it will vary
  * between microarchitectures), it is used to define the padding size that we intend to use.
@@ -46,7 +46,7 @@ constexpr const int cache_line_size = 64;
  * The size of a chunk.  The chunk size should be a multiple of the platform's
  * superpage size.
  */
-const int chunk_size = 2_MiB;
+const int chunk_size = 8_MiB;
 /**
  * The number of bytes in a page.  Note that 'page' here means the smallest
  * granularity at which we expect page table management operations to work, not
