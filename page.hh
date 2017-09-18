@@ -60,7 +60,7 @@ struct PageAllocator
 	}
 	T* allocate(std::size_t n)
 	{
-		return allocate_aligned(n);
+		return allocate_aligned(n, log2<chunk_size>());
 	}
 	void deallocate(T* p, std::size_t n)
 	{
