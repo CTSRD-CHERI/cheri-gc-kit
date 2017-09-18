@@ -127,6 +127,8 @@ constexpr unsigned long long int operator"" _MiB(unsigned long long int m)
 	return m * 1024 * 1024;
 }
 
+static_assert(log2<8_MiB>() == 23, "log2 is broken");
+
 /**
  * User defined literal for binary gigabytes.
  */
