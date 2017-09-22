@@ -39,7 +39,6 @@
 #include <memory>
 #include <stdlib.h>
 #include <inttypes.h>
-#include <cassert>
 
 #undef fprintf
 
@@ -81,6 +80,7 @@ class PageMetadata
 	 * Convenience type for the current template instantiation.
 	 */
 	using self_type = PageMetadata<ChunkBits, ASBits, PageSize, Header>;
+	static const int address_bits = sizeof(size_t) * 8;
 	/**
 	 * The index in the array of a virtual address.  Allocators are strongly
 	 * aligned, so we ignore the top bits in the address space that aren't
@@ -91,8 +91,8 @@ class PageMetadata
 	size_t index_for_vaddr(vaddr_t a)
 	{
 		// Trim off any high bits that might accidentally be set.
-		a <<= ASBits;
-		a >>= ASBits;
+		a <<= address_bits - ASBits;
+		a >>= address_bits - ASBits;
 		a >>= log2<chunk_size>();
 		return a;
 	}
@@ -112,7 +112,7 @@ class PageMetadata
 		static_assert(!std::is_polymorphic<self_type>::value,
 			"Page metadata class must not have a vtable!\n");
 		auto *pa = (PageAllocator<self_type>().allocate(1));
-		assert(pa);
+		ASSERT(pa);
 		return pa;
 	}
 	/**
@@ -128,8 +128,56 @@ class PageMetadata
 	 */
 	void set_allocator_for_address(Allocator<Header> *allocator, vaddr_t addr)
 	{
-		assert(allocator_for_address(addr) == nullptr);
+		fprintf(stderr, "Setting allocator %#p index %zu\n", allocator, index_for_vaddr(addr));
+		ASSERT(allocator_for_address(addr) == nullptr);
 		array.at(index_for_vaddr(addr)) = allocator;
+	}
+};
+
+/**
+ * Fast iterator state, used with iterators that request multiple objects from
+ * the underlying collections in a single call.
+ */
+template<typename Header>
+struct allocator_fast_iterator
+{
+	/**
+	 * The index of the end of the buffer.
+	 */
+	size_t end = 0;
+	/**
+	 * The index within the buffer of the current element.
+	 */
+	size_t buffer_idx = 0;
+	/**
+	 * The length of data in the buffer.
+	 */
+	size_t buffer_length = 0;
+	/**
+	 * The number of elements that the buffer has space for.
+	 */
+	static const size_t buffer_size = 64;
+	/**
+	 * The type of each element.
+	 */
+	using alloc = std::pair<void*, Header*>;
+	/**
+	 * Internal storage for the buffer elements.
+	 */
+	std::array<alloc, buffer_size> buffer;
+	/**
+	 * Dereference the iterator.
+	 */
+	alloc &operator*()
+	{
+		return buffer[buffer_idx];
+	}
+	/**
+	 * Compare two iterators.
+	 */
+	bool operator!=(const allocator_fast_iterator &other)
+	{
+		return (end != other.end) || (buffer_idx != other.buffer_idx);
 	}
 };
 
@@ -175,6 +223,11 @@ struct Allocator
 	 * but rather the bounds of a fixed-size allocation.
 	 */
 	virtual void *allocation_for_address(vaddr_t, Header *&) { return nullptr; }
+	/**
+	 * Fill the provided fast iteration state.  The index in the state should
+	 * be updated.
+	 */
+	virtual void fill_fast_iterator(allocator_fast_iterator<Header> &) {}
 };
 
 
@@ -210,6 +263,10 @@ class SmallAllocationHeader
 	 * The number of folios managed by this allocator.
 	 */
 	static const int folios_per_chunk = ChunkSize / folio_size;
+	/**
+	 * The total number of allocations per chunk.
+	 */
+	static const int allocs_per_chunk = allocs_per_folio * folios_per_chunk;
 	/**
 	 * Lock protecting this allocator.
 	 */
@@ -250,6 +307,10 @@ class SmallAllocationHeader
 		uint16_t free_count;
 		/**
 		 * Bitfield of the free allocations in this list.
+		 *
+		 * Note: This is misnamed.  Bits are *set* for allocated space and
+		 * *unset* for free, so this should really be called `allocated` or
+		 * something similar.
 		 */
 		BitSet<allocs_per_folio> free;
 	};
@@ -408,9 +469,9 @@ class SmallAllocationHeader
 			{
 				remove_list_entry(folio_idx);
 				l.free_count++;
-				assert(l.free[alloc_in_folio]);
+				ASSERT(l.free[alloc_in_folio]);
 				l.free.clear(alloc_in_folio);
-				assert(!l.free[alloc_in_folio]);
+				ASSERT(!l.free[alloc_in_folio]);
 				// TODO: By placing this back at the head of the list, we
 				// ensure that it will be reallocated quickly.  To reduce the
 				// danger of use-after-free, we probably want the opposite
@@ -451,15 +512,15 @@ class SmallAllocationHeader
 						return;
 					}
 				}
-				assert(free_head != 0);
+				ASSERT(free_head != 0);
 				if (free_head == 0)
 				{
 					return;
 				}
-				assert(free_lists[free_head] != folio::not_present);
+				ASSERT(free_lists[free_head] != folio::not_present);
 				folio_index = free_lists[free_head];
 				folio &l = folios[folio_index];
-				assert(l.free_count != 0);
+				ASSERT(l.free_count != 0);
 				remove_list_entry(folio_index);
 				l.free_count--;
 				insert_list_entry(folio_index);
@@ -468,18 +529,18 @@ class SmallAllocationHeader
 				{
 					fprintf(stderr, "Free list head is %d (%d), found full folio on free list\n", (int)free_head, (int)allocs_per_folio);
 				}
-				assert(offset < allocs_per_folio);
+				ASSERT(offset < allocs_per_folio);
 				free_head--;
-				assert(!l.free[offset]);
+				ASSERT(!l.free[offset]);
 				l.free.set(offset);
-				assert(l.free[offset]);
+				ASSERT(l.free[offset]);
 				free_allocs_total--;
 			}));
 		if (folio_index == folio::not_present)
 		{
 			return -1;
 		}
-		assert(folio_index * folio_size + (offset * AllocSize) > sizeof(*this));
+		ASSERT(folio_index * folio_size + (offset * AllocSize) > sizeof(*this));
 		return folio_index * folio_size + (offset * AllocSize);
 	}
 	/**
@@ -517,6 +578,40 @@ class SmallAllocationHeader
 		}
 		free_lists[l.free_count] = folio_idx;
 	}
+	template<size_t sz>
+	size_t allocations(std::array<size_t, sz> &vals, size_t start)
+	{
+		size_t written = 0;
+		while ((written < sz) && (start < allocs_per_chunk))
+		{
+			size_t folio_idx = start / allocs_per_folio;
+			size_t start_idx = start % allocs_per_folio;
+			size_t out_idx = start - start_idx;
+			start += allocs_per_folio - start_idx;
+			if (folio_idx >= folios_per_chunk)
+			{
+				break;
+			}
+			folio &f = folios[folio_idx];
+			if (f.free_count == allocs_per_folio)
+			{
+				continue;
+			}
+			// Find each set bit in the bitmap
+			for (int i=start_idx ; i<allocs_per_folio ; i=f.free.one_after(i))
+			{
+				if (written == sz)
+				{
+					return written;
+				}
+				if (f.free[i])
+				{
+					vals.at(written++) = out_idx + i;
+				}
+			}
+		}
+		return written;
+	}
 };
 
 /**
@@ -552,8 +647,7 @@ class SmallAllocator final : public Allocator<Header>,
 	 */
 	void *alloc(size_t sz) override
 	{
-		fprintf(stderr, "Allocating from %#p\n", this);
-		assert(sz <= AllocSize);
+		ASSERT(sz <= AllocSize);
 		size_t offset = ChunkHeader::reserve_allocation();
 		if (offset == -1)
 		{
@@ -585,12 +679,33 @@ class SmallAllocator final : public Allocator<Header>,
 		return reinterpret_cast<void*>(ptr.get());
 	}
 	/**
+	 * Collect the objects and headers for iteration.
+	 */
+	void fill_fast_iterator(allocator_fast_iterator<Header> &i) override
+	{
+		if (i.end == 0)
+		{
+			i.end = sizeof(*this) / AllocSize;
+		}
+		vaddr_t start = (vaddr_t)this;
+		std::array<size_t, allocator_fast_iterator<Header>::buffer_size> buf;
+		i.buffer_length = ChunkHeader::allocations(buf, i.end);
+		i.buffer_idx = 0;
+		for (int idx=0 ; idx<i.buffer_length ; idx++)
+		{
+			auto &a = i.buffer.at(idx);
+			i.end = buf.at(idx);
+			a.first = allocation_for_address(start + (buf.at(idx)*AllocSize), a.second);
+		}
+	}
+	/**
 	 * Free the object.
 	 */
 	bool free(void *ptr) override
 	{
+		fprintf(stderr, "Freeing: %#p\n", ptr);
 		size_t offset = reinterpret_cast<char*>(ptr) - reinterpret_cast<char*>(this);
-		assert(offset < chunk_size);
+		ASSERT(offset < chunk_size);
 		ChunkHeader::free_allocation(offset);
 		return false;
 	};
@@ -599,7 +714,7 @@ class SmallAllocator final : public Allocator<Header>,
 	 */
 	SmallAllocator() : ChunkHeader(sizeof(*this))
 	{
-		assert(!full());
+		ASSERT(!full());
 	}
 	public:
 	/**
@@ -639,7 +754,7 @@ struct small_allocator_factory
 		if (bucket == Bucket)
 		{
 			const size_t size = BucketSize<Bucket>::value;
-			//assert(bucket_for_size(size) == bucket);
+			//ASSERT(bucket_for_size(size) == bucket);
 			return SmallAllocator<size, Header>::create();
 		}
 		return small_allocator_factory<Header, Bucket-1>::create(bucket);
@@ -662,7 +777,7 @@ struct small_allocator_factory<Header, 0>
 		{
 			return SmallAllocator<BucketSize<0>::value, Header>::create();
 		}
-		assert(0);
+		ASSERT(0);
 		return nullptr;
 	}
 };
@@ -703,8 +818,8 @@ struct Buckets : public PageAllocated<Buckets<Header>>
 		if (a == nullptr)
 		{
 			a = small_allocator_factory<Header>::create(bucket);
-			assert(a->bucket() == bucket);
-			assert(!a->full());
+			ASSERT(a->bucket() == bucket);
+			ASSERT(!a->full());
 			p->set_allocator_for_address(a, (vaddr_t)a);
 			Allocator<Header> *old = nullptr;
 			while (!fixed_buckets[bucket].compare_exchange_weak(old, a, std::memory_order_relaxed))
@@ -731,7 +846,7 @@ struct Buckets : public PageAllocated<Buckets<Header>>
  * allocators.
  */
 template<typename Header>
-class slab_allocator
+class slab_allocator : public PageAllocated<slab_allocator<Header>>
 {
 	/**
 	 * Convenience name for the metadata array.
@@ -746,12 +861,13 @@ class slab_allocator
 	 */
 	Buckets<Header> global_buckets = { p };
 	public:
+	using object_header = Header;
 	/**
 	 * Allocate `size` bytes.
 	 */
 	void *alloc(size_t size)
 	{
-		assert(p);
+		ASSERT(p);
 		if (unlikely(size == 0))
 		{
 			return nullptr;
@@ -772,22 +888,177 @@ class slab_allocator
 	 */
 	void free(void *ptr)
 	{
-		assert(p);
+		ASSERT(p);
 		Allocator<Header> *a = p->allocator_for_address((vaddr_t)ptr);
-		assert(a);
+		ASSERT(a);
+		// FIXME: This needs to zero memory.
 		a->free(ptr);
 	}
 	/**
 	 * Returns the underlying allocation and the header for a given pointer.
 	 */
-	void *allocation_for_address(void *ptr, Header *&header)
+	void *object_for_allocation(void *ptr, Header *&header)
 	{
-		assert(this);
-		assert(p);
+		ASSERT(this);
+		ASSERT(p);
 		vaddr_t addr = (vaddr_t)ptr;
 		Allocator<Header> *a = p->allocator_for_address(addr);
-		assert(a);
+		if (!a)
+		{
+			header = nullptr;
+			return nullptr;
+		}
 		return a->allocation_for_address(addr, header);
+	}
+	/**
+	 * Forward iterator for iterating all allocations.
+	 */
+	class iterator
+	{
+		/**
+		 * The current allocator that we're iterating over.  Allocators are
+		 * arranged in a linked list for each size.
+		 */
+		Allocator<Header> *a = nullptr;
+		/**
+		 * The container that lets us find the heads of all of the linked
+		 * lists.
+		 */
+		Buckets<Header> &buckets;
+		/**
+		 * The iteration state for the current allocator.
+		 */
+		allocator_fast_iterator<Header> iter;
+		/**
+		 * Import the fast iterator's definition of an allocation.
+		 */
+		using alloc = typename allocator_fast_iterator<Header>::alloc;
+		/**
+		 * Has this iterator reached the end?
+		 */
+		bool end;
+		/**
+		 * Returns the next allocator after the specified bucket, or nullptr if
+		 * none exists.
+		 */
+		Allocator<Header> *allocator_from_bucket(int idx)
+		{
+			while (idx < fixed_buckets)
+			{
+				Allocator<Header> *allocator = buckets.fixed_buckets[idx++];
+				if (allocator)
+				{
+					return allocator;
+				}
+			}
+			return nullptr;
+		}
+		/**
+		 * Helper, fills the fast iterator state.
+		 */
+		void fill_iterator()
+		{
+			if (unlikely(a == nullptr))
+			{
+				ASSERT(iter.end == 0);
+				ASSERT(iter.buffer_length == 0);
+				a = allocator_from_bucket(0);
+				// No allocations yet?
+				if (unlikely(a == nullptr))
+				{
+					end = true;
+					return;
+				}
+			}
+			// If we have some data in the buffer, but we haven't completely
+			// filled it, then we've filled this allocator.
+			if ((iter.end > 0) && (iter.buffer_length < iter.buffer_size))
+			{
+				iter.end = 0;
+				iter.buffer_length = 0;
+				if (a->next)
+				{
+					a = a->next;
+				}
+				else
+				{
+					int bucket = a->bucket();
+					if (bucket < 1)
+					{
+						end = true;
+						return;
+					}
+					a = allocator_from_bucket(bucket + 1);
+				}
+				if (unlikely(a == nullptr))
+				{
+					end = true;
+					return;
+				}
+			}
+			ASSERT(a);
+			a->fill_fast_iterator(iter);
+			if (iter.buffer_length == 0)
+			{
+				fill_iterator();
+			}
+		}
+		public:
+		/**
+		 * Constructor.
+		 */
+		iterator(Buckets<Header> &b, bool e=false) : buckets(b), end(e) {}
+		alloc &operator*()
+		{
+			if (unlikely(iter.buffer_length == 0))
+			{
+				fill_iterator();
+			}
+			return iter.buffer.at(iter.buffer_idx);
+		}
+		/**
+		 * Increment the iterator.
+		 */
+		iterator &operator++()
+		{
+			iter.buffer_idx++;
+			if (unlikely(iter.buffer_idx >= iter.buffer_length))
+			{
+				fill_iterator();
+			}
+			return *this;
+		}
+		/**
+		 * Non-equality test, for terminating range-based for loop.
+		 */
+		bool operator!=(const iterator &other)
+		{
+			// If both are at the end, then these are equal (not not equal)
+			if (end && other.end)
+			{
+				return false;
+			}
+			// If only one is at the end, then these are not equal
+			if (end || other.end)
+			{
+				return true;
+			}
+			return (&buckets != &other.buckets) || (iter != other.iter);
+		}
+	};
+	/**
+	 * Returns a start iterator for all allocations.
+	 */
+	iterator begin()
+	{
+		return iterator(global_buckets);
+	}
+	/**
+	 * Returns an end iterator for all allocations.
+	 */
+	iterator end()
+	{
+		return iterator(global_buckets, true);
 	}
 };
 

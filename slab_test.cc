@@ -8,10 +8,24 @@ int main(void)
 {
 	void *x = a.alloc(42);
 	header *h;
-	void *y = a.allocation_for_address(x, h);
-	fprintf(stderr, "x: %#p\ny: %#p\nh: %#p\n", x, y, h);
-	x = b.alloc(42);
+	void *y = a.object_for_allocation(x, h);
+	assert(cheri::base(y) == cheri::base(x));
+	assert(cheri::length(h) == sizeof(*h));
+	for (auto &alloc : a)
+	{
+		assert(cheri::base(alloc.first) == cheri::base(x));
+		assert(cheri::length(alloc.second) == sizeof(*h));
+		assert(alloc.second == h);
+	}
 	void *p;
-	y = b.allocation_for_address(x, p);
-	fprintf(stderr, "x: %#p\ny: %#p\np: %#p\n", x, y, p);
+	x = b.alloc(42);
+	y = b.object_for_allocation(x, p);
+	assert(cheri::base(y) == cheri::base(x));
+	assert(p == nullptr);
+	for (auto &alloc : b)
+	{
+		assert(cheri::base(alloc.first) == cheri::base(x));
+		assert(cheri::length(alloc.second) == sizeof(*h));
+		assert(alloc.second == nullptr);
+	}
 }

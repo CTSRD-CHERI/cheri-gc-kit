@@ -107,6 +107,7 @@ class mark
 		// Initialise the header.
 		header->reset();
 		header->set_visited();
+		fprintf(stderr, "Marked object: %#p\n", p);
 		// Scan the contents of the object.
 		capability<void*> cap(static_cast<void**>(obj));
 		for (void *ptr : cap)

@@ -29,6 +29,8 @@
  */
 
 #include <type_traits>
+#include "utils.hh"
+#include "config.hh"
 
 namespace {
 
@@ -97,14 +99,42 @@ struct MediumBucketCandidate<1>
 };
 
 /**
+ * Returns the size of the largest small bucket.  This depends on the size of
+ * `void*`, because small allocations are all `void*`-aligned.
+ */
+constexpr unsigned largestSmallBucket()
+{
+	switch (sizeof(void*))
+	{
+		case 8: return 20;
+		case 16: return 18;
+		case 32: return 12;
+		default:
+			assert(0);
+			return -1;
+	}
+}
+
+/**
+ * Return the medium bucket number that is used to implement bucket `n`.  The
+ * number of small buckets depends on the size of the pointer, but the first
+ * bucket is always the one that handles 1088-byte allocations.
+ */
+constexpr unsigned medium_bucket_for_bucket(unsigned n)
+{
+	return n + 10 - largestSmallBucket();
+}
+
+
+/**
  * Template providing sizes of medium bucket sizes.  This assumes that the
  * first 20 buckets are calculated by some other mechanism.
  */
 template<unsigned N>
 struct MediumBucketSize 
 {
-	static_assert(N > 20, "The first 20 buckets are small");
-	static const unsigned value = MediumBucketCandidate<N-10>::value * cache_line_size;
+	static_assert(N > largestSmallBucket(), "The first buckets are small");
+	static const unsigned value = MediumBucketCandidate<medium_bucket_for_bucket(N)>::value * cache_line_size;
 };
 
 /**
@@ -112,7 +142,20 @@ struct MediumBucketSize
  */
 constexpr unsigned SmallBucketSize(size_t i)
 {
-	return (i > 20) ? 0 : (i < 5 ? ((i+1) * 8) : ((1<<(((i+12) >> 2))) * (((i+12) & 0b11) + 4)));
+	// Small buckets should not be for large bucket indexes
+	if (i > largestSmallBucket())
+	{
+		return -1;
+	}
+	// The smallest buckets are multiples of the pointer size
+	if (i < 5)
+	{
+		return ((i+1) * sizeof(void*));
+	}
+	// The remaining small buckets are computed by the sequence of bits with a
+	// 1, two arbitrary digits, and then all zeroes.  At least enough low bits
+	// must be zero to guarantee pointer alignment.
+	return ((1<<(((i+12) >> 2))) * ((((i+12) & 0b11) + 4) << (log2<sizeof(void*)>() - 3)));
 }
 
 /**
@@ -121,7 +164,7 @@ constexpr unsigned SmallBucketSize(size_t i)
 template<int Bucket>
 struct BucketSize
 {
-	static const int value = std::conditional<Bucket<21,
+	static const int value = std::conditional<Bucket<=largestSmallBucket(),
 				 std::integral_constant<unsigned, SmallBucketSize(Bucket)>,
 				 MediumBucketSize<Bucket>>::type::value;
 };
@@ -141,7 +184,7 @@ void print_primes<0>()
 }
 #endif
 
-static_assert(BucketSize<21>::value == 1088,
+static_assert(BucketSize<largestSmallBucket()+1>::value == 1088,
               "Medium bucket numbering starts in the wrong place");
 
 /**
