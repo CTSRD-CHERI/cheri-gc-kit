@@ -86,8 +86,17 @@ struct PageAllocated
 	void operator delete(void* ptr, size_t len)
 	{
 		allocator a;
-		a.deallocate(ptr, len / sizeof(T));
+		a.deallocate(reinterpret_cast<T*>(ptr), len / sizeof(T));
 	}
 };
+
+void zero_pages(cheri::capability<void> pages)
+{
+	assert(pages.length() % page_size == 0);
+	assert(pages.base() % page_size == 0);
+	void *ret = mmap(pages, pages.length(), PROT_READ | PROT_WRITE,
+			MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+	assert(ret != MAP_FAILED);
+}
 
 }

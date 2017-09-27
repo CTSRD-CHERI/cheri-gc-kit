@@ -61,8 +61,4 @@ const int chunk_size_bits = log2<chunk_size>();
  * The maximum number of cores that we support.
  */
 const int max_cores = 128;
-/**
- * The number of fixed-size buckets to use.
- */
-static const int fixed_buckets = 100;
 }

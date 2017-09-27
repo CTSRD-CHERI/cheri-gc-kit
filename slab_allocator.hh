@@ -128,7 +128,6 @@ class PageMetadata
 	 */
 	void set_allocator_for_address(Allocator<Header> *allocator, vaddr_t addr)
 	{
-		fprintf(stderr, "Setting allocator %#p index %zu\n", allocator, index_for_vaddr(addr));
 		ASSERT(allocator_for_address(addr) == nullptr);
 		array.at(index_for_vaddr(addr)) = allocator;
 	}
@@ -230,6 +229,64 @@ struct Allocator
 	virtual void fill_fast_iterator(allocator_fast_iterator<Header> &) {}
 };
 
+/**
+ * Template for storing either an array of headers, or nothing if the
+ * header type is void.  This allows the small allocator template to be
+ * instantiated with or without per-object headers, without suffering any
+ * space overhead.  In an optimised build, there should also be no run-time
+ * overhead (though there will be more work for the optimisers to delete
+ * dead code).
+ *
+ * FIXME: This should be moved into a superclass that's shared with
+ * `SmallAllocationHeader`, rather than copied and pasted.
+ */
+template<typename Header, size_t Size, class Enable = void>
+struct HeaderList {};
+/**
+ * Template specialisation with a void header type.  This provides a
+ * stub implementation that has a size of zero and a trivial method.
+ */
+template<typename Header, size_t Size>
+struct HeaderList<Header, Size, typename std::enable_if<std::is_void<Header>::value>::type>
+{
+	/**
+	 * A struct containing no members has size 1, but a struct containing a
+	 * zero-length array has size 0 in the Itanium ABI.
+	 */
+	int unused[0];
+	/**
+	 * If the header type is `void`, always return null for the header at
+	 * any index.
+	 */
+	Header *header_at_index(size_t idx)
+	{
+		return nullptr;
+	}
+};
+/**
+ * Template specialisation for non-`void` header types.
+ */
+template<typename Header, size_t Size>
+struct HeaderList<Header, Size, typename std::enable_if<!std::is_void<Header>::value>::type>
+{
+	/**
+	 * The array storing the headers.
+	 */
+	std::array<Header, Size> array;
+	/**
+	 * Accessor, returns the header at the specified index.
+	 */
+	Header *header_at_index(size_t idx)
+	{
+		cheri::capability<Header> h = &array.at(idx);
+		h.set_bounds(1);
+		return h.get();
+	}
+};
+
+// Compile-time check that the header list doesn't use any space when the
+// header type is void.
+static_assert(sizeof(HeaderList<void, 100>) == 0, "Compiler has odd ABI!\n");
 
 /**
  * The small allocation header.  This contains all of the metadata for a small
@@ -324,63 +381,9 @@ class SmallAllocationHeader
 	static_assert(allocs_per_folio < ((1<<16) - 1),
 			"Too many allocs per folio to use uint16_t for free count");
 	/**
-	 * Template for storing either an array of headers, or nothing if the
-	 * header type is void.  This allows the small allocator template to be
-	 * instantiated with or without per-object headers, without suffering any
-	 * space overhead.  In an optimised build, there should also be no run-time
-	 * overhead (though there will be more work for the optimisers to delete
-	 * dead code).
-	 */
-	template<typename HeaderTy, class Enable = void>
-	struct HeaderList {};
-	/**
-	 * Template specialisation with a void header type.  This provides a
-	 * stub implementation that has a size of zero and a trivial method.
-	 */
-	template<typename HeaderTy>
-	struct HeaderList<HeaderTy, typename std::enable_if<std::is_void<HeaderTy>::value>::type>
-	{
-		/**
-		 * A struct containing no members has size 1, but a struct containing a
-		 * zero-length array has size 0 in the Itanium ABI.
-		 */
-		int unused[0];
-		/**
-		 * If the header type is `void`, always return null for the header at
-		 * any index.
-		 */
-		Header *header_at_index(size_t idx)
-		{
-			return nullptr;
-		}
-	};
-	/**
-	 * Template specialisation for non-`void` header types.
-	 */
-	template<typename HeaderTy>
-	struct HeaderList<HeaderTy, typename std::enable_if<!std::is_void<HeaderTy>::value>::type>
-	{
-		/**
-		 * The array storing the headers.
-		 */
-		std::array<Header, folios_per_chunk*allocs_per_folio> array;
-		/**
-		 * Accessor, returns the header at the specified index.
-		 */
-		Header *header_at_index(size_t idx)
-		{
-			cheri::capability<Header> h = &array.at(idx);
-			h.set_bounds(1);
-			return h.get();
-		}
-	};
-	// Compile-time check that the header list doesn't use any space when the
-	// header type is void.
-	static_assert(sizeof(HeaderList<void>) == 0, "Compiler has odd ABI!\n");
-	/**
 	 * List of headers.
 	 */
-	HeaderList<Header> headers;
+	HeaderList<Header, allocs_per_chunk> headers;
 	public:
 	/**
 	 * Returns the header at the specified index.
@@ -481,7 +484,10 @@ class SmallAllocationHeader
 				free_allocs_total--;
 				if (l.free_count == alloc_in_folio)
 				{
-					madvise(reinterpret_cast<char*>(this)+offset, alloc_in_folio, MADV_FREE);
+					cheri::capability<void> folio_pages(reinterpret_cast<void*>(this));
+					folio_pages.set_offset(offset);
+					folio_pages.set_bounds(AllocSize * allocs_per_folio);
+					zero_pages(folio_pages);
 				}
 			}));
 		return free_allocs_total == 0;
@@ -615,17 +621,138 @@ class SmallAllocationHeader
 };
 
 /**
- * Small allocator.  This implements the methods defined in the abstract
- * allocator, but delegates most of the implementation to the
- * SmallAllocationHeader.
+ * Large allocation header.  Large allocations have roughly the same structure
+ * as small allocators, but don't attempt to reduce 
  */
-template<size_t AllocSize, typename Header>
-class SmallAllocator final : public Allocator<Header>,
-                             public SmallAllocationHeader<AllocSize, chunk_size, Header>,
-                             public PageAllocated<SmallAllocator<AllocSize, Header>>
+template<size_t AllocSize, size_t ChunkSize, typename Header>
+class LargeAllocationHeader
 {
-	using ChunkHeader = SmallAllocationHeader<AllocSize, chunk_size, Header>;
-	using self_type = SmallAllocator<AllocSize, Header>;
+	public:
+	/**
+	 * The number of allocations in each folio.
+	 */
+	static const size_t allocs_per_chunk = ChunkSize / AllocSize;
+	/**
+	 * Lock protecting this allocator.
+	 */
+	UncontendedSpinlock<long> lock;
+	/**
+	 * Bitfield of the free allocations in this list.
+	 *
+	 * Note: This is misnamed.  Bits are *set* for allocated space and
+	 * *unset* for free, so this should really be called `allocated` or
+	 * something similar.
+	 */
+	BitSet<allocs_per_chunk> free;
+	/**
+	 * List of headers.
+	 */
+	HeaderList<Header, allocs_per_chunk> headers;
+	public:
+	/**
+	 * Returns the header at the specified index.
+	 */
+	Header *header_at_index(size_t idx)
+	{
+		return headers.header_at_index(idx);
+	}
+	/**
+	 * The total number of free allocations in this allocator.
+	 */
+	uint32_t free_allocs_total;
+	/**
+	 * Constructor.  The parameter is the size of the subclass (or the size of
+	 * this class, if there is no subclass).  The allocator reserves all of the
+	 * allocations that would cover that space.
+	 *
+	 * Note: Ideally, we wouldn't reserve space for those, but then we end up
+	 * having to solve a constraints problem at compile time (shrinking the
+	 * size also shrinks the metadata size).  This is possible with templates,
+	 * but it's not trivial.
+	 */
+	LargeAllocationHeader(size_t size)
+	{
+		size_t allocs_for_header = (size + AllocSize - 1) / AllocSize;
+		for (auto i=0 ; i<allocs_for_header ; i++)
+		{
+			free.set(i);
+		}
+		free_allocs_total = allocs_per_chunk - allocs_for_header;
+	}
+	/**
+	 * Marks an allocation as free.
+	 */
+	void free_allocation(size_t offset)
+	{
+		// FIXME: We should abort if offset % AllocSize is non-zero
+		do {} while (!try_run_locked(lock, [&]()
+			{
+				int idx = offset / AllocSize;
+				free.clear(idx);
+				free_allocs_total++;
+				cheri::capability<void> pages(reinterpret_cast<void*>(this));
+				pages.set_offset(offset);
+				pages.set_bounds(AllocSize);
+				zero_pages(pages);
+			}));
+	}
+	/**
+	 * Return the offset of a free allocation and mark it as allocated.
+	 * Returns -1 if it is impossible to satisfy the allocation.  This can
+	 * happen even if the caller checks whether this is full, because another
+	 * thread may call `reserve_allocation` in parallel.
+	 */
+	size_t reserve_allocation()
+	{
+		size_t offset = -1;
+		// Grab the lock and try to find an allocation.
+		do {} while (!try_run_locked(lock, [&]()
+			{
+				if (free_allocs_total > 0)
+				{
+					offset = free.first_zero();
+					free.set(offset);
+					free_allocs_total--;
+				}
+			}));
+		return offset * AllocSize;
+	}
+	template<size_t sz>
+	size_t allocations(std::array<size_t, sz> &vals, size_t start)
+	{
+		size_t written = 0;
+		// Find each set bit in the bitmap
+		for (int i=free.one_after(start) ; i<allocs_per_chunk ; i=free.one_after(i))
+		{
+			if (written == sz)
+			{
+				return written;
+			}
+			if (free[i])
+			{
+				vals.at(written++) = i;
+			}
+		}
+		return written;
+	}
+};
+
+
+/**
+ * Fixed-sized allocator.  This implements the methods defined in the abstract
+ * allocator, but delegates most of the implementation to the AllocHeader.
+ *
+ * This class is used for small, medium, and large allocations as described in
+ * the SuperMalloc paper.  The only difference between small and medium
+ * allocators is the way in which their size is created, large allocators have
+ * simpler metadata.  
+ */
+template<size_t AllocSize, typename ChunkHeader, typename Header>
+class FixedAllocator final : public Allocator<Header>,
+                             public ChunkHeader,
+                             public PageAllocated<FixedAllocator<AllocSize, ChunkHeader, Header>>
+{
+	using self_type = FixedAllocator<AllocSize, ChunkHeader, Header>;
 	/**
 	 * Returns the size bucket for this allocator.
 	 */
@@ -703,7 +830,6 @@ class SmallAllocator final : public Allocator<Header>,
 	 */
 	bool free(void *ptr) override
 	{
-		fprintf(stderr, "Freeing: %#p\n", ptr);
 		size_t offset = reinterpret_cast<char*>(ptr) - reinterpret_cast<char*>(this);
 		ASSERT(offset < chunk_size);
 		ChunkHeader::free_allocation(offset);
@@ -712,7 +838,7 @@ class SmallAllocator final : public Allocator<Header>,
 	/**
 	 * Constructor.  Reserves space for all of the metadata.
 	 */
-	SmallAllocator() : ChunkHeader(sizeof(*this))
+	FixedAllocator() : ChunkHeader(sizeof(*this))
 	{
 		ASSERT(!full());
 	}
@@ -728,7 +854,150 @@ class SmallAllocator final : public Allocator<Header>,
 		char *p = PageAllocator<char>().allocate(chunk_size);
 		return ::new (p) self_type();
 	}
+};
 
+/**
+ * Small allocator.  Handles allocations that are either much smaller than a
+ * page or a few pages.  These are arranged in folios, and when an entire folio
+ * is freed the underlying pages can be returned to the OS.
+ */
+template<size_t AllocSize, typename Header>
+using SmallAllocator = FixedAllocator<AllocSize,
+                                      SmallAllocationHeader<AllocSize, chunk_size, Header>,
+                                      Header>;
+
+/**
+ * Large allocator.  Handles objects that are from 32KB to half of the size of
+ * a chunk.  Objects are allocated as a range of pages and are returned to the
+ * OS as soon as they're no longer needed.
+ */
+template<size_t AllocSize, typename Header>
+using LargeAllocator = FixedAllocator<AllocSize,
+                                      LargeAllocationHeader<AllocSize, chunk_size, Header>,
+                                      Header>;
+
+/**
+ * Huge allocator.  Allocates objects as a multiple of page size.  The huge
+ * allocator is responsible for objects that are more than half the size of a
+ * chunk.  These are allocated directly by mapping new pages from the OS.
+ */
+template<typename Header>
+class HugeAllocator final : public Allocator<Header>
+{
+	/**
+	 * Huge allocators must register themselves with the page metadata array.
+	 */
+	using PageMetadataArray = PageMetadata<chunk_size_bits, address_space_size_bits, page_size, Header>;
+	/**
+	 * The pointer that this allocator is responsible for.
+	 * 
+	 * Each huge allocator is responsible for only a single multi-page allocation.
+	 */
+	std::atomic<void*> allocation;
+	/**
+	 * The size of this allocation.
+	 */
+	size_t size = 0;
+	/**
+	 * The metadata array that's responsible for mapping from allocations to
+	 * allocators.  Huge allocators are responsible for updating this mapping
+	 * on each allocation.
+	 */
+	PageMetadataArray &metadata_array;
+	typename std::conditional<std::is_void<Header>::value, char[0], Header>::type header;
+	/**
+	 * Allocate a huge object.  Rounds up to a multiple of page size.
+	 */
+	void *alloc(size_t sz) override
+	{
+		// FIXME: We should add some entropy to the start address
+		sz = roundUp<page_size>(sz);
+		void *a = reinterpret_cast<void*>(PageAllocator<char>().allocate(sz));
+		void *expected = nullptr;
+		if (allocation.compare_exchange_strong(expected, a))
+		{
+			metadata_array.set_allocator_for_address(this, (vaddr_t)expected);
+			size = sz;
+			return a;
+		}
+		PageAllocator<char>().deallocate(reinterpret_cast<char*>(a), sz);
+		return nullptr;
+	}
+	/**
+	 * Returns the object size.
+	 */
+	size_t object_size(void *) override
+	{
+		return size;
+	}
+	/**
+	 * Free an object in this allocator.  Returns true if the allocator has
+	 * just transitioned from a full state to a non-full state, at which point
+	 * it can be added to a list of allocators from which to allocate new
+	 * objects of this size.
+	 */
+	bool free(void *ptr) override
+	{
+		cheri::capability<void> cap(allocation);
+		if (cap.contains(cheri::base(ptr)))
+		{
+			void *alloc = nullptr;
+			allocation.compare_exchange_strong(alloc, nullptr);
+			// This can be nullptr if two threads race to free the same allocation.
+			// This should never happen in a GC environment.
+			if (alloc)
+			{
+				metadata_array.set_allocator_for_address(nullptr, (vaddr_t)alloc);
+				PageAllocator<char>().deallocate(reinterpret_cast<char*>(alloc), size);
+				return true;
+			}
+		}
+		return false;
+	}
+	/**
+	 * Return whether the allocator is full (i.e. unable to allocate anything
+	 * else).
+	 */
+	bool full() override
+	{
+		return allocation != nullptr;
+	}
+	/**
+	 * Returns a pointer to the allocation for the address and, via the second
+	 * argument, a pointer to the header for the object.
+	 *
+	 * Note that fixed-sized allocators may not give the bounds of the object,
+	 * but rather the bounds of a fixed-size allocation.
+	 */
+	void *allocation_for_address(vaddr_t addr, Header *&h) override
+	{
+		cheri::capability<void> cap(allocation);
+		if (cap.contains(addr))
+		{
+			h = &header;
+			return allocation;
+		}
+		return nullptr;
+	}
+	/**
+	 * Fill the provided fast iteration state.  This allocator is responsible
+	 * for a single allocation.
+	 */
+	void fill_fast_iterator(allocator_fast_iterator<Header> &i) override
+	{
+		i.buffer_idx = 0;
+		if ((i.end == 0) && (allocation != nullptr))
+		{
+			i.buffer[0] = { allocation.load(), &header };
+			i.buffer_length = 1;
+			i.end = 1;
+		}
+	}
+	public:
+	/**
+	 * Constructor.  Takes the metadata array as an argument.
+	 */
+	HugeAllocator(PageMetadataArray &p) : metadata_array(p) {}
 };
 
 /**
@@ -742,13 +1011,14 @@ class SmallAllocator final : public Allocator<Header>,
  * a base case of 0 for the second template parameter (the bucket), for any
  * given `Header` value.
  */
-template<typename Header, size_t Bucket = fixed_buckets>
+template<typename Header, size_t Bucket = largest_medium_bucket()>
 struct small_allocator_factory
 {
 	/**
 	 * Create an allocator in the specified `bucket`.  The value of `bucket`
 	 * must be lower than the `Bucket` template value.
 	 */
+	__attribute__((always_inline))
 	static Allocator<Header>* create(int bucket)
 	{
 		if (bucket == Bucket)
@@ -782,6 +1052,44 @@ struct small_allocator_factory<Header, 0>
 	}
 };
 
+template<typename Header, size_t Bucket = largest_large_bucket()>
+struct large_allocator_factory
+{
+	/**
+	 * Create an allocator in the specified `bucket`.  The value of `bucket`
+	 * must be lower than the `Bucket` template value.
+	 */
+	__attribute__((always_inline))
+	static Allocator<Header>* create(int bucket)
+	{
+		if (bucket == Bucket)
+		{
+			const size_t size = BucketSize<Bucket>::value;
+			//ASSERT(bucket_for_size(size) == bucket);
+			return LargeAllocator<size, Header>::create();
+		}
+		return large_allocator_factory<Header, Bucket-1>::create(bucket);
+	}
+};
+
+template<typename Header>
+struct large_allocator_factory<Header, 0>
+{
+	/**
+	 * Base case for `create` function.  Either creates an allocator with
+	 * bucket 0, or returns a null pointer.
+	 */
+	static Allocator<Header>* create(int bucket)
+	{
+		if (bucket == 0)
+		{
+			return LargeAllocator<BucketSize<0>::value, Header>::create();
+		}
+		ASSERT(0);
+		return nullptr;
+	}
+};
+
 /**
  * Manager for allocators.  Constructs new allocators on demand.
  */
@@ -800,27 +1108,104 @@ struct Buckets : public PageAllocated<Buckets<Header>>
 	/**
 	 * Pointer to the index that stores the map from address to allocator.
 	 */
-	PageMetadataArray *p;
+	PageMetadataArray &p;
+	using HugeAllocatorAllocator = SmallAllocator<sizeof(HugeAllocator<Header>), void>;
+	/**
+	 * Allocator used to allocate huge allocators.  Huge allocation metadata is
+	 * stored out of line from the rest of the allocation, and is quite small.
+	 */
+	std::atomic<HugeAllocatorAllocator*> huge_allocator_allocator;
+	/**
+	 * Head of a linked list of huge allocators that are free for reuse.
+	 */
+	std::atomic<HugeAllocator<Header>*> free_huge_allocators;
+	/**
+	 * Head of a linked list of huge allocators that are still valid.
+	 */
+	std::atomic<HugeAllocator<Header>*> huge_allocators;
+
+	Allocator<Header> *huge_allocator()
+	{
+		if (huge_allocator_allocator == nullptr)
+		{
+			auto *aa = HugeAllocatorAllocator::create();
+			HugeAllocatorAllocator *expected = nullptr;
+			// If we lost the race to create this allocator
+			if (!huge_allocator_allocator.compare_exchange_strong(expected, aa))
+			{
+				delete aa;
+				ASSERT(expected != nullptr);
+			}
+		}
+		auto *aa = huge_allocator_allocator.load();
+		// FIXME: Reuse huge allocators
+		void *buffer = static_cast<Allocator<void>*>(aa)->alloc(sizeof(HugeAllocator<Header>));
+		// The buffer will be null if the allocator became full (possibly as a
+		// result of allocations in another thread).
+		if (buffer == nullptr)
+		{
+			auto *new_allocator_allocator = HugeAllocatorAllocator::create();
+			// If we lost a race to allocate a new allocator allocator, delete
+			// our new one.  Either way, try again - now that this is visible,
+			// it's possible (though highly unlikely) that we'll be preempted
+			// by another thread that will use up all of the space in this
+			// allocator.
+			if (!huge_allocator_allocator.compare_exchange_strong(aa, new_allocator_allocator))
+			{
+				delete new_allocator_allocator;
+			}
+			return huge_allocator();
+		}
+		auto *a = new (buffer) HugeAllocator<Header>(p);
+		ASSERT(a);
+		auto *expected = huge_allocators.load();
+		do
+		{
+			a->next = expected;
+		} while (!huge_allocators.compare_exchange_strong(expected, a));
+		// FIXME: We need to remove these from the list when they're freed.
+		// It's probably better when iterating over huge allocators to simply
+		// allocate over the objects allocated by the allocator-allocator and
+		// special case the ones that haven't had their vtables set.
+		return a;
+	}
+	public:
 	/**
 	 * Constructor. 
 	 */
-	Buckets(PageMetadataArray *metadata) : p(metadata) {}
+	Buckets(PageMetadataArray &metadata) : p(metadata) {}
 	/**
 	 * Returns an allocator for a specific bucket.  If there is no existing
 	 * bucket, then one is created.
 	 */
 	Allocator<Header> *allocator_for_bucket(size_t bucket)
 	{
+		if (unlikely(bucket == -1))
+		{
+			return huge_allocator();
+		}
 		// No lock held.  The returned object is not locked, so callers may
 		// need to try multiple times to get an allocator that has empty space.
 		Allocator<Header> *a = fixed_buckets[bucket].load(std::memory_order_relaxed);
 		// FIXME: Handle creating huge allocators for things that want to just be mmap'd.
 		if (a == nullptr)
 		{
-			a = small_allocator_factory<Header>::create(bucket);
+			if (bucket <= largest_medium_bucket())
+			{
+				a = small_allocator_factory<Header>::create(bucket);
+			}
+			else if (bucket <= largest_large_bucket())
+			{
+				a = large_allocator_factory<Header>::create(bucket);
+			}
+			else
+			{
+				ASSERT(0);
+			}
+			ASSERT(a);
 			ASSERT(a->bucket() == bucket);
 			ASSERT(!a->full());
-			p->set_allocator_for_address(a, (vaddr_t)a);
+			p.set_allocator_for_address(a, (vaddr_t)a);
 			Allocator<Header> *old = nullptr;
 			while (!fixed_buckets[bucket].compare_exchange_weak(old, a, std::memory_order_relaxed))
 			{
@@ -859,7 +1244,7 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 	/**
 	 * Fixed-size allocator manager.
 	 */
-	Buckets<Header> global_buckets = { p };
+	Buckets<Header> global_buckets = { *p };
 	public:
 	using object_header = Header;
 	/**
@@ -950,6 +1335,11 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 				{
 					return allocator;
 				}
+			}
+			if (idx == fixed_buckets)
+			{
+				idx++;
+				return buckets.huge_allocators;
 			}
 			return nullptr;
 		}

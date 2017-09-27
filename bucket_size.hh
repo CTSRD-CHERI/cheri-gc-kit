@@ -102,7 +102,7 @@ struct MediumBucketCandidate<1>
  * Returns the size of the largest small bucket.  This depends on the size of
  * `void*`, because small allocations are all `void*`-aligned.
  */
-constexpr unsigned largestSmallBucket()
+constexpr unsigned largest_small_bucket()
 {
 	switch (sizeof(void*))
 	{
@@ -116,13 +116,25 @@ constexpr unsigned largestSmallBucket()
 }
 
 /**
+ * Returns the size of the largest medium bucket.
+ */
+constexpr unsigned largest_medium_bucket()
+{
+	// This is value is the size of the largest medium bucket that is less than
+	// 32KiB.  This doesn't change depending on pointer size, so we're hard
+	// coding it rather than computing it.
+	return 107;
+}
+
+
+/**
  * Return the medium bucket number that is used to implement bucket `n`.  The
  * number of small buckets depends on the size of the pointer, but the first
  * bucket is always the one that handles 1088-byte allocations.
  */
 constexpr unsigned medium_bucket_for_bucket(unsigned n)
 {
-	return n + 10 - largestSmallBucket();
+	return n + 10 - largest_small_bucket();
 }
 
 
@@ -133,9 +145,10 @@ constexpr unsigned medium_bucket_for_bucket(unsigned n)
 template<unsigned N>
 struct MediumBucketSize 
 {
-	static_assert(N > largestSmallBucket(), "The first buckets are small");
+	static_assert(N > largest_small_bucket(), "The first buckets are small");
 	static const unsigned value = MediumBucketCandidate<medium_bucket_for_bucket(N)>::value * cache_line_size;
 };
+
 
 /**
  * Helper function that defines the size of a small bucket.
@@ -143,7 +156,7 @@ struct MediumBucketSize
 constexpr unsigned SmallBucketSize(size_t i)
 {
 	// Small buckets should not be for large bucket indexes
-	if (i > largestSmallBucket())
+	if (i > largest_small_bucket())
 	{
 		return -1;
 	}
@@ -158,16 +171,33 @@ constexpr unsigned SmallBucketSize(size_t i)
 	return ((1<<(((i+12) >> 2))) * ((((i+12) & 0b11) + 4) << (log2<sizeof(void*)>() - 3)));
 }
 
+constexpr size_t large_bucket_size(int bucket)
+{
+	if (bucket < largest_medium_bucket())
+	{
+		return 0;
+	}
+	bucket -= largest_medium_bucket();
+	return (bucket * page_size) + 32_KiB;
+}
+
 /**
  * Template that defines all of the bucket sizes.
  */
 template<int Bucket>
 struct BucketSize
 {
-	static const int value = std::conditional<Bucket<=largestSmallBucket(),
+	static const int value = std::conditional<(Bucket<=largest_small_bucket()),
 				 std::integral_constant<unsigned, SmallBucketSize(Bucket)>,
-				 MediumBucketSize<Bucket>>::type::value;
+				 typename std::conditional<(Bucket<=largest_medium_bucket()),
+				   MediumBucketSize<Bucket>,
+				   std::integral_constant<unsigned, large_bucket_size(Bucket)>>::type>::type::value;
 };
+
+static_assert(BucketSize<largest_medium_bucket()>::value < 32_KiB,
+		"Largest medium bucket is too big");
+static_assert(BucketSize<largest_medium_bucket()+1>::value >= 32_KiB,
+		"Largest medium bucket is too small");
 
 #if 0
 #undef fprintf
@@ -184,7 +214,7 @@ void print_primes<0>()
 }
 #endif
 
-static_assert(BucketSize<largestSmallBucket()+1>::value == 1088,
+static_assert(BucketSize<largest_small_bucket()+1>::value == 1088,
               "Medium bucket numbering starts in the wrong place");
 
 /**
@@ -193,7 +223,7 @@ static_assert(BucketSize<largestSmallBucket()+1>::value == 1088,
  * and relies on the 
  */
 template<int Bucket>
-constexpr int bucket_for_size(size_t size)
+constexpr int small_bucket_for_size(size_t size)
 {
 	if ((size <= BucketSize<Bucket>::value) && (size > BucketSize<Bucket-1>::value))
 	{
@@ -201,22 +231,49 @@ constexpr int bucket_for_size(size_t size)
 	}
 	if (size <= BucketSize<Bucket/4>::value)
 	{
-		return bucket_for_size<Bucket/4>(size);
+		return small_bucket_for_size<Bucket/4>(size);
 	}
 	if (size <= BucketSize<Bucket/2>::value)
 	{
-		return bucket_for_size<Bucket/2>(size);
+		return small_bucket_for_size<Bucket/2>(size);
 	}
-	return bucket_for_size<Bucket-1>(size);
+	return small_bucket_for_size<Bucket-1>(size);
 }
 /**
  * Base case specialisation.
  */
 template<>
-constexpr int bucket_for_size<0>(size_t size)
+constexpr int small_bucket_for_size<0>(size_t size)
 {
 	return (size <= BucketSize<0>::value) ? 0 : -1;
 }
+
+/**
+ * Returns the large bucket that corresponds to a specific size.  Large buckets
+ * are allocated in a multiple of the page size, starting at 32KiB.
+ */
+constexpr int large_bucket_for_size(size_t sz)
+{
+	ASSERT(sz >= 32_KiB);
+	ASSERT(sz <= chunk_size / 4);
+	// Round up the requested size to the nearest multiple of the page size,
+	// then subtract a constant such that large bucket 0 is 32KiB.
+	return ((sz + page_size-1) / page_size) - (32_KiB / page_size);
+}
+/**
+ * Returns the number of the largest large bucket.  Above this size, huge
+ * allocators manage memory provided directly by the operating system's page
+ * allocator.
+ */
+constexpr int largest_large_bucket()
+{
+	return large_bucket_for_size(chunk_size / 4);
+}
+
+static_assert(large_bucket_for_size(32_KiB) == 0,
+		"Large buckets start in the wrong place!");
+static_assert(large_bucket_for_size(32_KiB + page_size + 1) == 2,
+		"Large don't round correctly!");
 
 /**
  * Function that maps from size to bucket.  Uses `bucket_for_size<>` for medium
@@ -225,27 +282,24 @@ constexpr int bucket_for_size<0>(size_t size)
 __attribute__((always_inline))
 constexpr int bucket_for_size(size_t sz)
 {
-	if (sz <= 64)
+	// FIXME: The optimisations for SuperMalloc are not quite right here, so
+	// they're gone for now, but this is a 
+	if (sz < 32_KiB)
 	{
-		size_t div8 = sz >> 3;
-		if (div8 << 3 == sz)
-		{
-			div8--;
-		}
-		return div8;
+		return small_bucket_for_size<largest_medium_bucket()>(sz);
 	}
-	if (sz <= 320)
+	if (sz < (chunk_size / 4))
 	{
-		int z = __builtin_clzll(sz);
-		size_t r = sz + (1ULL << (61-z)) -1;
-		int y = __builtin_clzll(r);
-		int bin = (4 * (60-y)+((r>>(61-y))&3)) - 8;
-		assert(bin == bucket_for_size<25>(sz));
-		assert(SmallBucketSize(bin) >= sz);
-		assert(SmallBucketSize(bin-1) < sz);
-		return bin;
+		return large_bucket_for_size(sz) + largest_medium_bucket();
 	}
-	return bucket_for_size<fixed_buckets>(sz);
+	// Not a fixed-sized bucket at all
+	return -1;
 }
+
+/**
+ * The number of fixed-size buckets to use.
+ */
+static const int fixed_buckets = largest_medium_bucket() + largest_large_bucket();
+
 
 }
