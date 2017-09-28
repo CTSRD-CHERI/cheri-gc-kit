@@ -165,19 +165,13 @@ struct allocator_fast_iterator
 	 */
 	std::array<alloc, buffer_size> buffer;
 	/**
-	 * Dereference the iterator.
-	 */
-	alloc &operator*()
-	{
-		return buffer[buffer_idx];
-	}
-	/**
 	 * Compare two iterators.
 	 */
 	bool operator!=(const allocator_fast_iterator &other)
 	{
 		return (end != other.end) || (buffer_idx != other.buffer_idx);
 	}
+
 };
 
 /**
@@ -722,7 +716,7 @@ class LargeAllocationHeader
 	{
 		size_t written = 0;
 		// Find each set bit in the bitmap
-		for (int i=free.one_after(start) ; i<allocs_per_chunk ; i=free.one_after(i))
+		for (int i=start ; i<allocs_per_chunk ; i=free.one_after(i))
 		{
 			if (written == sz)
 			{
@@ -812,7 +806,7 @@ class FixedAllocator final : public Allocator<Header>,
 	{
 		if (i.end == 0)
 		{
-			i.end = sizeof(*this) / AllocSize;
+			i.end = (sizeof(*this) + AllocSize-1) / AllocSize;
 		}
 		vaddr_t start = (vaddr_t)this;
 		std::array<size_t, allocator_fast_iterator<Header>::buffer_size> buf;
@@ -821,7 +815,7 @@ class FixedAllocator final : public Allocator<Header>,
 		for (int idx=0 ; idx<i.buffer_length ; idx++)
 		{
 			auto &a = i.buffer.at(idx);
-			i.end = buf.at(idx);
+			i.end = buf.at(idx)+1;
 			a.first = allocation_for_address(start + (buf.at(idx)*AllocSize), a.second);
 		}
 	}
@@ -882,7 +876,7 @@ using LargeAllocator = FixedAllocator<AllocSize,
  * chunk.  These are allocated directly by mapping new pages from the OS.
  */
 template<typename Header>
-class HugeAllocator final : public Allocator<Header>
+struct HugeAllocator final : public Allocator<Header>
 {
 	/**
 	 * Huge allocators must register themselves with the page metadata array.
@@ -1115,14 +1109,6 @@ struct Buckets : public PageAllocated<Buckets<Header>>
 	 * stored out of line from the rest of the allocation, and is quite small.
 	 */
 	std::atomic<HugeAllocatorAllocator*> huge_allocator_allocator;
-	/**
-	 * Head of a linked list of huge allocators that are free for reuse.
-	 */
-	std::atomic<HugeAllocator<Header>*> free_huge_allocators;
-	/**
-	 * Head of a linked list of huge allocators that are still valid.
-	 */
-	std::atomic<HugeAllocator<Header>*> huge_allocators;
 
 	Allocator<Header> *huge_allocator()
 	{
@@ -1158,15 +1144,6 @@ struct Buckets : public PageAllocated<Buckets<Header>>
 		}
 		auto *a = new (buffer) HugeAllocator<Header>(p);
 		ASSERT(a);
-		auto *expected = huge_allocators.load();
-		do
-		{
-			a->next = expected;
-		} while (!huge_allocators.compare_exchange_strong(expected, a));
-		// FIXME: We need to remove these from the list when they're freed.
-		// It's probably better when iterating over huge allocators to simply
-		// allocate over the objects allocated by the allocator-allocator and
-		// special case the ones that haven't had their vtables set.
 		return a;
 	}
 	public:
@@ -1245,66 +1222,143 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 	 * Fixed-size allocator manager.
 	 */
 	Buckets<Header> global_buckets = { *p };
-	public:
-	using object_header = Header;
-	/**
-	 * Allocate `size` bytes.
-	 */
-	void *alloc(size_t size)
+	class huge_allocator_iterator
 	{
-		ASSERT(p);
-		if (unlikely(size == 0))
+		using alloc = typename allocator_fast_iterator<Header>::alloc;
+		/**
+		 * flag indicating that we have reached the end of the huge iterators.
+		 */
+		bool end = false;
+		/**
+		 * The allocator used for huge allocators.
+		 */
+		Allocator<void> *a;
+		/**
+		 * Array storing the valid allocators that we've found.
+		 */
+		std::array<alloc, allocator_fast_iterator<void>::buffer_size> allocators;
+		/**
+		 * Iteration state in the current allocator.
+		 */
+		allocator_fast_iterator<void> iter;
+		/**
+		 * Current index in the array that we're iterating over.
+		 */
+		int idx = 0;
+		/**
+		 * For iterators before the end, the index from the first allocator
+		 * that we found.
+		 */
+		int global_idx = 0;
+		/**
+		 * Number of allocators that we've found in the `allocators` array.
+		 */
+		int allocator_count = 0;
+		/**
+		 * Helper method to fill the `allocators` array.
+		 */
+		void fill_iterator()
 		{
-			return nullptr;
-		}
-		int bucket = bucket_for_size(size);
-		while (true)
-		{
-			auto *a = global_buckets.allocator_for_bucket(bucket);
-			void *allocation = a->alloc(size);
-			if (allocation)
+			if (a == nullptr)
 			{
-				return allocation;
+				end = true;
+				return;
+			}
+			if (end)
+			{
+				return;
+			}
+			a->fill_fast_iterator(iter);
+			if (iter.buffer_length == 0)
+			{
+				a = a->next;
+				if (a == nullptr)
+				{
+					end = true;
+				}
+				fill_iterator();
+				return;
+			}
+			idx = 0;
+			allocator_count = 0;
+			for (int i=0 ; i<iter.buffer_length ; i++)
+			{
+				auto *ha = reinterpret_cast<HugeAllocator<Header>*>(iter.buffer[i].first);
+				if (ha->allocation != nullptr)
+				{
+					allocators[allocator_count++] = { ha->allocation, &ha->header };
+				}
+			}
+			if (allocator_count == 0)
+			{
+				fill_iterator();
 			}
 		}
-	}
-	/**
-	 * Free the specified pointer.
-	 */
-	void free(void *ptr)
-	{
-		ASSERT(p);
-		Allocator<Header> *a = p->allocator_for_address((vaddr_t)ptr);
-		ASSERT(a);
-		// FIXME: This needs to zero memory.
-		a->free(ptr);
-	}
-	/**
-	 * Returns the underlying allocation and the header for a given pointer.
-	 */
-	void *object_for_allocation(void *ptr, Header *&header)
-	{
-		ASSERT(this);
-		ASSERT(p);
-		vaddr_t addr = (vaddr_t)ptr;
-		Allocator<Header> *a = p->allocator_for_address(addr);
-		if (!a)
+		public:
+		/**
+		 * Constructor, takes the first allocator in the chain that allocates
+		 * over huge allocators as an argument.
+		 */
+		huge_allocator_iterator(Allocator<void> *allocator) : a(allocator)
 		{
-			header = nullptr;
-			return nullptr;
+			fill_iterator();
 		}
-		return a->allocation_for_address(addr, header);
-	}
+		/**
+		 * Constructor for creating an iterator pointing to the end.
+		 */
+		huge_allocator_iterator() : a(nullptr), end(true) {}
+		/**
+		 * Increment operator.  Finds the next valid huge allocator.
+		 */
+		huge_allocator_iterator &operator++()
+		{
+			idx++;
+			global_idx++;
+			if (idx >= allocator_count)
+			{
+				fill_iterator();
+			}
+			return *this;
+		}
+		/**
+		 * Dereference operator.  Returns the current huge allocator.
+		 */
+		alloc &operator*()
+		{
+			return allocators[idx];
+		}
+		/**
+		 * Non-equality test, for terminating range-based for loop.
+		 */
+		bool operator!=(const huge_allocator_iterator &other)
+		{
+			// If both are at the end, then these are equal (not not equal)
+			if (end && other.end)
+			{
+				return false;
+			}
+			// If only one is at the end, then these are not equal
+			if (end || other.end)
+			{
+				return true;
+			}
+			return global_idx != other.global_idx;
+		}
+	};
 	/**
 	 * Forward iterator for iterating all allocations.
 	 */
-	class iterator
+	class fixed_allocator_iterator
 	{
 		/**
 		 * The current allocator that we're iterating over.  Allocators are
 		 * arranged in a linked list for each size.
 		 */
 		Allocator<Header> *a = nullptr;
+		/**
+		 * The allocator used for huge allocators.
+		 */
+		Allocator<void> *huge_allocators = nullptr;
 		/**
 		 * The container that lets us find the heads of all of the linked
 		 * lists.
@@ -1321,7 +1375,7 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 		/**
 		 * Has this iterator reached the end?
 		 */
-		bool end;
+		bool end = false;
 		/**
 		 * Returns the next allocator after the specified bucket, or nullptr if
 		 * none exists.
@@ -1335,11 +1389,6 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 				{
 					return allocator;
 				}
-			}
-			if (idx == fixed_buckets)
-			{
-				idx++;
-				return buckets.huge_allocators;
 			}
 			return nullptr;
 		}
@@ -1397,7 +1446,7 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 		/**
 		 * Constructor.
 		 */
-		iterator(Buckets<Header> &b, bool e=false) : buckets(b), end(e) {}
+		fixed_allocator_iterator(Buckets<Header> &b, bool e=false) : buckets(b), end(e) {}
 		alloc &operator*()
 		{
 			if (unlikely(iter.buffer_length == 0))
@@ -1409,7 +1458,7 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 		/**
 		 * Increment the iterator.
 		 */
-		iterator &operator++()
+		fixed_allocator_iterator &operator++()
 		{
 			iter.buffer_idx++;
 			if (unlikely(iter.buffer_idx >= iter.buffer_length))
@@ -1421,7 +1470,7 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 		/**
 		 * Non-equality test, for terminating range-based for loop.
 		 */
-		bool operator!=(const iterator &other)
+		bool operator!=(const fixed_allocator_iterator &other)
 		{
 			// If both are at the end, then these are equal (not not equal)
 			if (end && other.end)
@@ -1436,19 +1485,74 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 			return (&buckets != &other.buckets) || (iter != other.iter);
 		}
 	};
+	public:
+	using object_header = Header;
+	/**
+	 * Allocate `size` bytes.
+	 */
+	void *alloc(size_t size)
+	{
+		ASSERT(p);
+		if (unlikely(size == 0))
+		{
+			return nullptr;
+		}
+		int bucket = bucket_for_size(size);
+		while (true)
+		{
+			auto *a = global_buckets.allocator_for_bucket(bucket);
+			void *allocation = a->alloc(size);
+			if (allocation)
+			{
+				return allocation;
+			}
+		}
+	}
+	/**
+	 * Free the specified pointer.
+	 */
+	void free(void *ptr)
+	{
+		ASSERT(p);
+		Allocator<Header> *a = p->allocator_for_address((vaddr_t)ptr);
+		ASSERT(a);
+		// FIXME: This needs to zero memory.
+		a->free(ptr);
+	}
+	/**
+	 * Returns the underlying allocation and the header for a given pointer.
+	 */
+	void *object_for_allocation(void *ptr, Header *&header)
+	{
+		ASSERT(this);
+		ASSERT(p);
+		vaddr_t addr = (vaddr_t)ptr;
+		Allocator<Header> *a = p->allocator_for_address(addr);
+		if (!a)
+		{
+			header = nullptr;
+			return nullptr;
+		}
+		return a->allocation_for_address(addr, header);
+	}
+	using iterator = SplicedForwardIterator<fixed_allocator_iterator, huge_allocator_iterator>;
 	/**
 	 * Returns a start iterator for all allocations.
 	 */
 	iterator begin()
 	{
-		return iterator(global_buckets);
+		return iterator(std::move(fixed_allocator_iterator(global_buckets)),
+		                std::move(fixed_allocator_iterator(global_buckets, true)),
+		                std::move(huge_allocator_iterator(global_buckets.huge_allocator_allocator)));
 	}
 	/**
 	 * Returns an end iterator for all allocations.
 	 */
 	iterator end()
 	{
-		return iterator(global_buckets, true);
+		return iterator(std::move(fixed_allocator_iterator(global_buckets, true)),
+		                std::move(fixed_allocator_iterator(global_buckets, true)),
+		                std::move(huge_allocator_iterator()));
 	}
 };
 

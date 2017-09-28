@@ -38,9 +38,9 @@ int main(void)
 	int idx = 0;
 	for (auto &alloc : b)
 	{
+		assert(idx < allocs.size());
 		assert(cheri::base(alloc.first) == cheri::base(allocs.at(idx)));
 		idx++;
 	}
 	assert(idx == 3);
-
 }
