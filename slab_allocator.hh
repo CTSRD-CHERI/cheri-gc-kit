@@ -910,7 +910,11 @@ struct HugeAllocator final : public Allocator<Header>
 		void *expected = nullptr;
 		if (allocation.compare_exchange_strong(expected, a))
 		{
-			metadata_array.set_allocator_for_address(this, (vaddr_t)expected);
+			vaddr_t addr = (vaddr_t)expected;
+			for (vaddr_t i=0 ; i<sz ; i+=chunk_size)
+			{
+				metadata_array.set_allocator_for_address(this, addr + i);
+			}
 			size = sz;
 			return a;
 		}
@@ -941,7 +945,11 @@ struct HugeAllocator final : public Allocator<Header>
 			// This should never happen in a GC environment.
 			if (alloc)
 			{
-				metadata_array.set_allocator_for_address(nullptr, (vaddr_t)alloc);
+				vaddr_t addr = (vaddr_t)alloc;
+				for (vaddr_t i=0 ; i<size ; i+=chunk_size)
+				{
+					metadata_array.set_allocator_for_address(nullptr, addr + i);
+				}
 				PageAllocator<char>().deallocate(reinterpret_cast<char*>(alloc), size);
 				return true;
 			}
