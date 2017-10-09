@@ -128,7 +128,7 @@ class PageMetadata
 	 */
 	void set_allocator_for_address(Allocator<Header> *allocator, vaddr_t addr)
 	{
-		ASSERT(allocator_for_address(addr) == nullptr);
+		ASSERT((allocator == nullptr) || (allocator_for_address(addr) == nullptr));
 		array.at(index_for_vaddr(addr)) = allocator;
 	}
 };
@@ -870,6 +870,9 @@ using LargeAllocator = FixedAllocator<AllocSize,
                                       LargeAllocationHeader<AllocSize, chunk_size, Header>,
                                       Header>;
 
+template<typename Header>
+struct Buckets;
+
 /**
  * Huge allocator.  Allocates objects as a multiple of page size.  The huge
  * allocator is responsible for objects that are more than half the size of a
@@ -898,6 +901,14 @@ struct HugeAllocator final : public Allocator<Header>
 	 * on each allocation.
 	 */
 	PageMetadataArray &metadata_array;
+	/**
+	 * The owner for this allocator.
+	 */
+	Buckets<Header> &owner;
+	/**
+	 * Either the header, or a zero-sized allocation, depending on whether we
+	 * have a header type.
+	 */
 	typename std::conditional<std::is_void<Header>::value, char[0], Header>::type header;
 	/**
 	 * Allocate a huge object.  Rounds up to a multiple of page size.
@@ -910,7 +921,7 @@ struct HugeAllocator final : public Allocator<Header>
 		void *expected = nullptr;
 		if (allocation.compare_exchange_strong(expected, a))
 		{
-			vaddr_t addr = (vaddr_t)expected;
+			vaddr_t addr = (vaddr_t)a;
 			for (vaddr_t i=0 ; i<sz ; i+=chunk_size)
 			{
 				metadata_array.set_allocator_for_address(this, addr + i);
@@ -939,19 +950,33 @@ struct HugeAllocator final : public Allocator<Header>
 		cheri::capability<void> cap(allocation);
 		if (cap.contains(cheri::base(ptr)))
 		{
-			void *alloc = nullptr;
-			allocation.compare_exchange_strong(alloc, nullptr);
+			void *alloc = allocation.load();
 			// This can be nullptr if two threads race to free the same allocation.
 			// This should never happen in a GC environment.
-			if (alloc)
+			if (!alloc)
+			{
+				return false;
+			}
+			// After this point, this allocator should not be found by any iterators.
+			if (allocation.compare_exchange_strong(alloc, nullptr))
 			{
 				vaddr_t addr = (vaddr_t)alloc;
 				for (vaddr_t i=0 ; i<size ; i+=chunk_size)
 				{
 					metadata_array.set_allocator_for_address(nullptr, addr + i);
 				}
+				// After this point, the allocator can't be found by mapping
+				// from an allocation to an allocator.  In an environment with
+				// manual memory management, this is a race, but is okay
+				// because it can only be triggered by a use-after-free, which
+				// is undefined.
+				// In an environment with garbage collection, only the GC
+				// should call this method and should do so only after
+				// eliminating all of the pointers from which this object can
+				// be looked up.  It is therefore safe to delete the object
+				// after unmapping the memory.
 				PageAllocator<char>().deallocate(reinterpret_cast<char*>(alloc), size);
-				return true;
+				return delete_self();
 			}
 		}
 		return false;
@@ -995,11 +1020,17 @@ struct HugeAllocator final : public Allocator<Header>
 			i.end = 1;
 		}
 	}
+	/**
+	 * Delete this object.  This is called when the object managed by this
+	 * allocator is freed, after removing the allocator from all metadata that
+	 * refers to it and then deleting it.
+	 */
+	bool delete_self();
 	public:
 	/**
 	 * Constructor.  Takes the metadata array as an argument.
 	 */
-	HugeAllocator(PageMetadataArray &p) : metadata_array(p) {}
+	HugeAllocator(PageMetadataArray &p, Buckets<Header> &b) : metadata_array(p), owner(b) {}
 };
 
 /**
@@ -1111,13 +1142,20 @@ struct Buckets : public PageAllocated<Buckets<Header>>
 	 * Pointer to the index that stores the map from address to allocator.
 	 */
 	PageMetadataArray &p;
+	/**
+	 * Allocator type used to allocate huge allocators.  This allocator doesn't
+	 * need to store per-object headers, even if the huge allocators that it
+	 * allocates do.
+	 */
 	using HugeAllocatorAllocator = SmallAllocator<sizeof(HugeAllocator<Header>), void>;
 	/**
 	 * Allocator used to allocate huge allocators.  Huge allocation metadata is
 	 * stored out of line from the rest of the allocation, and is quite small.
 	 */
 	std::atomic<HugeAllocatorAllocator*> huge_allocator_allocator;
-
+	/**
+	 * Construct a huge allocator.
+	 */
 	Allocator<Header> *huge_allocator()
 	{
 		if (huge_allocator_allocator == nullptr)
@@ -1132,13 +1170,18 @@ struct Buckets : public PageAllocated<Buckets<Header>>
 			}
 		}
 		auto *aa = huge_allocator_allocator.load();
-		// FIXME: Reuse huge allocators
+		// FIXME: If we allocate a *lot* of huge allocations, then we never
+		// reuse space from allocators after the head of this list.  It would
+		// be better to maintain two lists, protected by a lock: whenever we
+		// create or destroy a huge allocator, we're calling m[un]map, so an
+		// extra lock and unlock on this path is unlikely to be significant.
 		void *buffer = static_cast<Allocator<void>*>(aa)->alloc(sizeof(HugeAllocator<Header>));
 		// The buffer will be null if the allocator became full (possibly as a
 		// result of allocations in another thread).
 		if (buffer == nullptr)
 		{
 			auto *new_allocator_allocator = HugeAllocatorAllocator::create();
+			new_allocator_allocator->next = huge_allocator_allocator;
 			// If we lost a race to allocate a new allocator allocator, delete
 			// our new one.  Either way, try again - now that this is visible,
 			// it's possible (though highly unlikely) that we'll be preempted
@@ -1150,7 +1193,7 @@ struct Buckets : public PageAllocated<Buckets<Header>>
 			}
 			return huge_allocator();
 		}
-		auto *a = new (buffer) HugeAllocator<Header>(p);
+		auto *a = new (buffer) HugeAllocator<Header>(p, *this);
 		ASSERT(a);
 		return a;
 	}
@@ -1208,7 +1251,32 @@ struct Buckets : public PageAllocated<Buckets<Header>>
 		}
 		return a;
 	}
+	/**
+	 * Delete a huge allocator.
+	 */
+	bool delete_huge_allocator(HugeAllocator<Header> *a)
+	{
+		for (Allocator<void> *allocator = huge_allocator_allocator.load() ;
+		     allocator ;
+		     allocator = allocator->next.load())
+		{
+			cheri::capability<Allocator<void>> alloc_cap(allocator);
+			if (alloc_cap.contains(a))
+			{
+				assert(a->allocation == nullptr);
+				allocator->free(a);
+				return true;
+			}
+		}
+		return false;
+	}
 };
+
+template<typename Header>
+bool HugeAllocator<Header>::delete_self()
+{
+	return owner.delete_huge_allocator(this);
+}
 
 
 /**
@@ -1523,6 +1591,10 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 	{
 		ASSERT(p);
 		Allocator<Header> *a = p->allocator_for_address((vaddr_t)ptr);
+		if (!a)
+		{
+			fprintf(stderr, "Failed to find allocator for %#p\n", ptr);
+		}
 		ASSERT(a);
 		// FIXME: This needs to zero memory.
 		a->free(ptr);

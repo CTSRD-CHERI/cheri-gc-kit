@@ -42,5 +42,16 @@ int main(void)
 		assert(cheri::base(alloc.first) == cheri::base(allocs.at(idx)));
 		idx++;
 	}
-	assert(idx == 3);
+	assert(idx == allocs.size());
+	b.free(allocs[2]);
+	idx = 0;
+	for (auto &alloc : b)
+	{
+		//assert(idx < allocs.size() - 1);
+		//fprintf(stderr, "Alloc %i: %#p\n", idx, alloc.first);
+		//ASSERT(cheri::base(alloc.first) == cheri::base(allocs[idx]));
+		idx++;
+	}
+	assert(idx == allocs.size() - 1);
+	return 0;
 }
