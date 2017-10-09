@@ -40,12 +40,34 @@ namespace
 {
 
 /**
+ * Simple template class that returns true from its call method.  This is the
+ * default filter for marking - always mark every object.
+ */
+template<class Header>
+struct always_true
+{
+	/**
+	 * Returns true.  This implementation is intended to be optimised away.
+	 */
+	bool operator()(const Header &, const void*)
+	{
+		return true;
+	}
+};
+
+/**
  * Mark and compact garbage collector, based on the LISP2 design.
  *
  * Takes an object responsible for tracking the roots and a heap implementation
- * as template parameters.
+ * as template parameters, as well as a header and a filter class.  The
+ * allocator is expected to associate an instance of the header class with each
+ * object.  The header object must respond to queries related to mark state.
+ *
+ * The filter class allows some objects to be ignored.  For example, if the GC
+ * can guarantee that an object has not been used to store pointers, then it
+ * can skip scanning.
  */
-template<class RootSet, class Heap, class Header>
+template<class RootSet, class Heap, class Header, class Filter=always_true<Header>>
 class mark
 {
 	protected:
@@ -90,6 +112,12 @@ class mark
 		// All non-GC memory is either a root (in which case we've seen it
 		// already), or assumed not to point to GC'd objects.
 		if (!obj)
+		{
+			return;
+		}
+		Filter f;
+		// If the GC policy tells us to ignore this object, then skip it.
+		if (!f(*header, obj))
 		{
 			return;
 		}
