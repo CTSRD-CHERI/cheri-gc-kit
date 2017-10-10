@@ -199,10 +199,6 @@ class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header, skip_fr
 	 */
 	using Super::h;
 	/**
-	 * Import the visited counter from the superclass.
-	 */
-	using Super::visited;
-	/**
 	 * Import the mark list from the superclass.
 	 */
 	using Super::mark_list;
@@ -224,7 +220,7 @@ class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header, skip_fr
 			if (alloc.second->is_free)
 			{
 				memset(cheri::set_offset(alloc.first, 0), 0, cheri::length(alloc.first));
-				fprintf(stderr, "Still reachable free'd object: %#p\n", alloc.first);
+				++free_reachable;
 			}
 			if (alloc.second->is_unmarked())
 			{
@@ -238,6 +234,14 @@ class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header, skip_fr
 	}
 	public:
 	/**
+	 * Import the visited counter from the superclass and make it public.
+	 */
+	using Super::visited;
+	/**
+	 * Counter for the number of free objects that are still reachable.
+	 */
+	Counter<> free_reachable;
+	/**
 	 * Constructor.
 	 */
 	mark_and_sweep(Heap &heap) : Super(heap)
@@ -249,6 +253,7 @@ class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header, skip_fr
 	void collect()
 	{
 		visited = 0;
+		free_reachable = 0;
 		jmp_buf jb;
 		// Spill caller-save registers from any calling frames to the stack.
 		// This lets later code update them as if they were simply in-memory

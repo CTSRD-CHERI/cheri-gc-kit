@@ -111,12 +111,14 @@ heap_type *get_heap()
 }
 }
 
+static int allocated;
 /**
  * Public interface to allocate garbage-collected memory.
  */
 extern "C"
 void *GC_malloc(size_t size)
 {
+	allocated++;
 	return get_heap()->alloc(size);
 }
 
@@ -182,13 +184,34 @@ int main()
 		l->next = head;
 		head = l;
 	}
+	int64_t base = cheri::base(head);
+	int val = head->val;
+	fprintf(stderr, "Allocated %d objects\n", allocated);
 	// Run the GC, should not find any garbage.
 	GC_collect();
-	fprintf(stderr, "Head: %#p\n", head);
-	// Clear the next element of the head.  Should now have 99 dead objects.
+	fprintf(stderr, "Found %d live objects\n", (int)gc->visited);
+	assert(gc->free_reachable == 0);
+	assert(gc->visited == allocated);
+	assert(gc->visited == allocated);
+	assert(val == head->val);
+	// Shorten the list
 	fprintf(stderr, "Truncating list!\n");
+	head->next->next->next->next = nullptr;
+	fprintf(stderr, "Run collector again\n");
+	// Clear any temporary registers, so that we don't accidentally have
+	// pointers in them.
+	clear_regs();
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	GC_collect();
+	fprintf(stderr, "Found %d live objects\n", (int)gc->visited);
+	assert(base == cheri::base(head));
+	assert(gc->visited == 4);
+	assert(gc->free_reachable == 0);
+	assert(val == head->val);
+	// Clear the next element of the head.
+	fprintf(stderr, "Deleting second element in list!\n");
+	// Delete the object, but leave a dangling pointer.
 	delete head->next;
-	//head->next = nullptr;
 	// Clear any temporary registers, so that we don't accidentally have
 	// pointers in them.
 	clear_regs();
@@ -197,7 +220,11 @@ int main()
 	fprintf(stderr, "Run collector again\n");
 	fprintf(stderr, "Head val: %d\n", head->val);
 	GC_collect();
-	// Head value should be the same, but head object should be moved.
-	fprintf(stderr, "Head: %#p\n", head);
-	fprintf(stderr, "Head val: %d\n", head->val);
+	fprintf(stderr, "Found %d live objects, %d still-reachable free objects\n", (int)gc->visited, (int)gc->free_reachable);
+	assert(gc->visited == 1);
+	assert(gc->free_reachable == 1);
+	assert(base == cheri::base(head));
+	assert(val == head->val);
+	// Freed object should have been zeroed during GC.
+	assert(head->next->next == nullptr);
 }
