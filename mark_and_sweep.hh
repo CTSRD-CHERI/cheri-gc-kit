@@ -169,8 +169,6 @@ struct skip_free
 		{
 			return true;
 		}
-		// Zero objects that are free
-		memset(cheri::set_offset(obj, 0), 0, cheri::length(obj));
 		return false;
 	}
 };
@@ -225,6 +223,7 @@ class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header, skip_fr
 			ASSERT(!alloc.second->is_marked() || alloc.second->is_free);
 			if (alloc.second->is_free)
 			{
+				memset(cheri::set_offset(alloc.first, 0), 0, cheri::length(alloc.first));
 				fprintf(stderr, "Still reachable free'd object: %#p\n", alloc.first);
 			}
 			if (alloc.second->is_unmarked())
