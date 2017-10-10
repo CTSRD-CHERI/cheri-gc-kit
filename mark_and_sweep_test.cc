@@ -121,6 +121,15 @@ void *GC_malloc(size_t size)
 }
 
 /**
+ * Public interface to mark garbage-collected memory as free.
+ */
+extern "C"
+void GC_free(void *ptr)
+{
+	gc->free(ptr);
+}
+
+/**
  * Public interface to force early garbage collection.
  */
 extern "C"
@@ -157,6 +166,10 @@ struct list
 		//fprintf(stderr, "Allocated %zu bytes: %#p\n", sz, a);
 		return a;
 	}
+	void operator delete(void* ptr)
+	{
+		GC_free(ptr);
+	}
 };
 
 int main()
@@ -174,7 +187,8 @@ int main()
 	fprintf(stderr, "Head: %#p\n", head);
 	// Clear the next element of the head.  Should now have 99 dead objects.
 	fprintf(stderr, "Truncating list!\n");
-	head->next = nullptr;
+	delete head->next;
+	//head->next = nullptr;
 	// Clear any temporary registers, so that we don't accidentally have
 	// pointers in them.
 	clear_regs();

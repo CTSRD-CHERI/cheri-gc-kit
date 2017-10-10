@@ -73,6 +73,10 @@ class mark_and_sweep_object_header
 	bool contains_pointers:1;
 	public:
 	/**
+	 * Has this object been free'd?
+	 */
+	bool is_free:1;
+	/**
 	 * Helper for debugging: dump the header in a human-readable format.
 	 */
 	void dump()
@@ -157,6 +161,20 @@ class mark_and_sweep_object_header
 	}
 };
 
+struct skip_free
+{
+	bool operator()(mark_and_sweep_object_header &h, void *obj)
+	{
+		if (!h.is_free)
+		{
+			return true;
+		}
+		// Zero objects that are free
+		memset(cheri::set_offset(obj, 0), 0, cheri::length(obj));
+		return false;
+	}
+};
+
 // The header is expected to be a single byte.
 static_assert(sizeof(mark_and_sweep_object_header) == 1,
 		"Header is larger than expected!");
@@ -168,12 +186,12 @@ static_assert(sizeof(mark_and_sweep_object_header) == 1,
  * as template parameters.
  */
 template<class RootSet, class Heap>
-class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header>
+class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header, skip_free>
 {
 	/**
 	 * Import the superclass name.
 	 */
-	using Super = mark<RootSet, Heap, mark_and_sweep_object_header>;
+	using Super = mark<RootSet, Heap, mark_and_sweep_object_header, skip_free>;
 	/**
 	 * Import the mark set from the superclass.
 	 */
@@ -204,12 +222,16 @@ class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header>
 	{
 		for (auto alloc : h)
 		{
-			ASSERT(!alloc.second->is_marked());
+			ASSERT(!alloc.second->is_marked() || alloc.second->is_free);
+			if (alloc.second->is_free)
+			{
+				fprintf(stderr, "Still reachable free'd object: %#p\n", alloc.first);
+			}
 			if (alloc.second->is_unmarked())
 			{
 				h.free(alloc.first);
 			}
-			else if (alloc.second->is_visited())
+			else
 			{
 				alloc.second->reset();
 			}
@@ -248,6 +270,15 @@ class mark_and_sweep : mark<RootSet, Heap, mark_and_sweep_object_header>
 		// FIXME: We should probably zero caller-save capability registers
 		// before returning.
 		_longjmp(jb, 1);
+	}
+	void free(void *obj)
+	{
+		mark_and_sweep_object_header *header = nullptr;
+		h.object_for_allocation(obj, header);
+		if (header)
+		{
+			header->is_free = true;
+		}
 	}
 };
 
