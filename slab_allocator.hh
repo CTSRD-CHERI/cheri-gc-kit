@@ -826,6 +826,7 @@ class FixedAllocator final : public Allocator<Header>,
 	{
 		size_t offset = reinterpret_cast<char*>(ptr) - reinterpret_cast<char*>(this);
 		ASSERT(offset < chunk_size);
+		memset(reinterpret_cast<char*>(this)+offset, 0, AllocSize);
 		ChunkHeader::free_allocation(offset);
 		return false;
 	};
@@ -1596,7 +1597,6 @@ class slab_allocator : public PageAllocated<slab_allocator<Header>>
 			fprintf(stderr, "Failed to find allocator for %#p\n", ptr);
 		}
 		ASSERT(a);
-		// FIXME: This needs to zero memory.
 		a->free(ptr);
 	}
 	/**
